@@ -1,0 +1,21 @@
+{
+    "scene": "my_base_scene.json",
+    "camera": {
+        "x": 0,
+        "y": 1,
+        "z": -2,
+        "rotX": 0,
+        "rotY": 0,
+        "rotZ": 0,
+        "fov": 23
+    },
+    "clothing": {
+        "top": [1, 5, 12, 20],
+        "bottom": [2, 8, 15],
+        "shoes": [3, 10],
+        "socks": [1, 5]
+    },
+    "animations": ["idle", "walk", "wave"],
+    "frames": 12,
+    "output_dir": "./render_output"
+}
