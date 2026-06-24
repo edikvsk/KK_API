@@ -124,6 +124,11 @@ print(r.json())
 python tools/test.py
 ```
 
+### GLB Export Test
+```bash
+python tools/test_glb.py
+```
+
 ### Batch Sprite Renderer
 Automate frame-by-frame capture with different clothing combinations:
 ```bash
