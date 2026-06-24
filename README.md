@@ -76,6 +76,14 @@ List characters currently in scene.
 curl http://localhost:8080/list-characters
 ```
 
+### POST /export-glb
+Export selected character body mesh as GLB (glTF 2.0 Binary) file.
+```bash
+curl -X POST "http://localhost:8080/export-glb?filename=character.glb"
+```
+
+Files saved to `UserData/export/`. The exported mesh captures the current pose via BakeMesh.
+
 ## Python Example
 
 ```python
@@ -103,6 +111,10 @@ requests.post(f"{BASE_URL}/set-clothing?type=bottom&id=2")
 # Take another screenshot
 time.sleep(0.5)
 requests.post(f"{BASE_URL}/screenshot?filename=test2.png")
+
+# Export character as GLB
+r = requests.post(f"{BASE_URL}/export-glb?filename=character.glb")
+print(r.json())
 ```
 
 ## Python Tools

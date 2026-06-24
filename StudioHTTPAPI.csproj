@@ -9,23 +9,19 @@
 
   <ItemGroup>
     <Reference Include="BepInEx">
-      <HintPath>../BepInEx.dll</HintPath>
+      <HintPath>C:\Games\KK\KKIRV2\BepInEx\core\BepInEx.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="UnityEngine">
-      <HintPath>../../Koikatu_Data/Managed/UnityEngine.dll</HintPath>
-      <Private>false</Private>
-    </Reference>
-    <Reference Include="UnityEngine.CoreModule">
-      <HintPath>../../Koikatu_Data/Managed/UnityEngine.CoreModule.dll</HintPath>
+      <HintPath>C:\Games\KK\KKIRV2\Koikatu_Data\Managed\UnityEngine.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="Assembly-CSharp">
-      <HintPath>../../Koikatu_Data/Managed/Assembly-CSharp.dll</HintPath>
+      <HintPath>C:\Games\KK\KKIRV2\Koikatu_Data\Managed\Assembly-CSharp.dll</HintPath>
       <Private>false</Private>
     </Reference>
     <Reference Include="KKAPI">
-      <HintPath>../../BepInEx/plugins/KKAPI.dll</HintPath>
+      <HintPath>C:\Games\KK\KKIRV2\BepInEx\plugins\KKAPI.dll</HintPath>
       <Private>false</Private>
     </Reference>
   </ItemGroup>

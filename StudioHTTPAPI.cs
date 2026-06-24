@@ -109,6 +109,7 @@ namespace StudioHTTPAPI
                     case "/set-camera": body = SetCamera(query); break;
                     case "/add-character": body = AddCharacter(query); break;
                     case "/list-characters": body = ListCharacters(); break;
+                    case "/export-glb": body = ExportGlb(query); break;
                     default: body = "{\"error\":\"not found\"}"; break;
                 }
                 var bodyBytes = Encoding.UTF8.GetBytes(body);
@@ -318,6 +319,81 @@ namespace StudioHTTPAPI
             catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
         }
 
+        private string ExportGlb(string query)
+        {
+            var filename = GetParam(query, "filename");
+            if (string.IsNullOrEmpty(filename)) filename = "export_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".glb";
+            if (!filename.EndsWith(".glb")) filename += ".glb";
+            var dir = UserDataPath("export");
+            Directory.CreateDirectory(dir);
+            var fullPath = Path.Combine(dir, filename);
+            var capturedPath = fullPath;
+
+            try
+            {
+                var cc = GetSelectedChaControl();
+                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character selected\"}";
+
+                SkinnedMeshRenderer bodyRenderer = FindBodyRenderer(cc);
+                if (ReferenceEquals(bodyRenderer, null)) return "{\"error\":\"no body mesh found\"}";
+
+                Mesh bakedMesh = new Mesh();
+                bodyRenderer.BakeMesh(bakedMesh);
+
+                Texture2D bodyTexture = ExtractTexture(bodyRenderer);
+
+                byte[] glbBytes = GlbBuilder.Build(bakedMesh, bodyTexture, "body");
+                File.WriteAllBytes(capturedPath, glbBytes);
+
+                Log("GLB exported: " + capturedPath + " (" + glbBytes.Length + " bytes)");
+                return "{\"status\":\"ok\",\"path\":\"" + Escape(capturedPath) + "\",\"size\":" + glbBytes.Length + "}";
+            }
+            catch (Exception ex)
+            {
+                Log("ExportGlb err: " + ex.GetType().Name + " " + ex.Message);
+                return "{\"error\":\"" + Escape(ex.Message) + "\"}";
+            }
+        }
+
+        private SkinnedMeshRenderer FindBodyRenderer(ChaControl cc)
+        {
+            SkinnedMeshRenderer best = null;
+            int bestVerts = 0;
+            FindBodyRendererRecursive(cc.transform, ref best, ref bestVerts);
+            return best;
+        }
+
+        private void FindBodyRendererRecursive(Transform t, ref SkinnedMeshRenderer best, ref int bestVerts)
+        {
+            var smr = t.GetComponent<SkinnedMeshRenderer>();
+            if (!ReferenceEquals(smr, null) && !ReferenceEquals(smr.sharedMesh, null))
+            {
+                int v = smr.sharedMesh.vertexCount;
+                if (v > bestVerts) { bestVerts = v; best = smr; }
+            }
+            for (int i = 0; i < t.childCount; i++)
+                FindBodyRendererRecursive(t.GetChild(i), ref best, ref bestVerts);
+        }
+
+        private Texture2D ExtractTexture(SkinnedMeshRenderer renderer)
+        {
+            if (ReferenceEquals(renderer, null) || renderer.sharedMaterials.Length == 0) return null;
+            var mat = renderer.sharedMaterials[0];
+            if (ReferenceEquals(mat, null)) return null;
+            var tex = mat.GetTexture("_MainTex") as Texture2D;
+            if (ReferenceEquals(tex, null)) return null;
+            var tmp = RenderTexture.GetTemporary(tex.width, tex.height, 0, RenderTextureFormat.Default, RenderTextureReadWrite.sRGB);
+            Graphics.Blit(tex, tmp);
+            var prev = RenderTexture.active;
+            RenderTexture.active = tmp;
+            var readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false);
+            readable.ReadPixels(new Rect(0, 0, tex.width, tex.height), 0, 0);
+            readable.Apply();
+            RenderTexture.active = prev;
+            RenderTexture.ReleaseTemporary(tmp);
+            return readable;
+        }
+
         private object GetStudioInstance()
         {
             var t = FindType("Studio.Studio");
@@ -395,6 +471,165 @@ namespace StudioHTTPAPI
         private static string Escape(string s) { if (s == null) return ""; return s.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", ""); }
         private static void Log(string msg) { try { if (!ReferenceEquals(_logPath, null)) File.AppendAllText(_logPath, "[" + DateTime.Now.ToString("HH:mm:ss") + "] " + msg + "\n"); } catch { } }
         private void OnDestroy() { isRunning = false; try { tcpListener.Stop(); } catch { } Log("Server stopped"); }
+    }
+
+    public static class GlbBuilder
+    {
+        public static byte[] Build(Mesh mesh, Texture2D texture, string name)
+        {
+            var vertices = mesh.vertices;
+            var normals = mesh.normals;
+            var uv = mesh.uv;
+            var triangles = mesh.triangles;
+
+            bool useUint32 = vertices.Length > 65535;
+            int indexSize = useUint32 ? 4 : 2;
+            int indexComponentType = useUint32 ? 5125 : 5123;
+
+            int posBytes = vertices.Length * 12;
+            int normBytes = normals.Length * 12;
+            int uvBytes = uv.Length * 8;
+            int idxBytes = triangles.Length * indexSize;
+            int texBytes = 0;
+            byte[] texPng = null;
+            if (!ReferenceEquals(texture, null))
+            {
+                texPng = texture.EncodeToPNG();
+                texBytes = texPng.Length;
+            }
+
+            int binTotal = posBytes + normBytes + uvBytes + idxBytes;
+            if (texBytes > 0) binTotal += texBytes;
+
+            int bvIdx = 0;
+            int bvPos = bvIdx++; int bvNorm = bvIdx++; int bvUv = bvIdx++; int bvIdxBV = bvIdx++; int bvTex = -1;
+            if (texBytes > 0) bvTex = bvIdx++;
+
+            float minX = float.MaxValue, minY = float.MaxValue, minZ = float.MaxValue;
+            float maxX = float.MinValue, maxY = float.MinValue, maxZ = float.MinValue;
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                var v = vertices[i];
+                if (v.x < minX) minX = v.x; if (v.x > maxX) maxX = v.x;
+                if (v.y < minY) minY = v.y; if (v.y > maxY) maxY = v.y;
+                if (v.z < minZ) minZ = v.z; if (v.z > maxZ) maxZ = v.z;
+            }
+
+            string json = "{";
+            json += "\"asset\":{\"version\":\"2.0\",\"generator\":\"StudioHTTPAPI\"}";
+            json += ",\"scene\":0,\"scenes\":[{\"nodes\":[0]}]";
+            json += ",\"nodes\":[{\"mesh\":0,\"name\":\"" + EscapeJson(name) + "\"}]";
+            json += ",\"meshes\":[{\"primitives\":[{\"attributes\":{\"POSITION\":0,\"NORMAL\":1,\"TEXCOORD_0\":2},\"indices\":3,\"material\":0}]}]";
+            json += ",\"accessors\":[";
+            json += "{\"bufferView\":" + bvPos + ",\"componentType\":5126,\"count\":" + vertices.Length + ",\"type\":\"VEC3\",\"min\":[" + F(minX) + "," + F(minY) + "," + F(minZ) + "],\"max\":[" + F(maxX) + "," + F(maxY) + "," + F(maxZ) + "]}";
+            json += ",{\"bufferView\":" + bvNorm + ",\"componentType\":5126,\"count\":" + normals.Length + ",\"type\":\"VEC3\"}";
+            json += ",{\"bufferView\":" + bvUv + ",\"componentType\":5126,\"count\":" + uv.Length + ",\"type\":\"VEC2\"}";
+            json += ",{\"bufferView\":" + bvIdxBV + ",\"componentType\":" + indexComponentType + ",\"count\":" + triangles.Length + ",\"type\":\"SCALAR\"}";
+            json += "]";
+            json += ",\"bufferViews\":[";
+            json += "{\"buffer\":0,\"byteOffset\":0,\"byteLength\":" + posBytes + ",\"target\":34962}";
+            json += ",{\"buffer\":0,\"byteOffset\":" + posBytes + ",\"byteLength\":" + normBytes + ",\"target\":34962}";
+            json += ",{\"buffer\":0,\"byteOffset\":" + (posBytes + normBytes) + ",\"byteLength\":" + uvBytes + ",\"target\":34962}";
+            json += ",{\"buffer\":0,\"byteOffset\":" + (posBytes + normBytes + uvBytes) + ",\"byteLength\":" + idxBytes + ",\"target\":34963}";
+            if (texBytes > 0) json += ",{\"buffer\":0,\"byteOffset\":" + (posBytes + normBytes + uvBytes + idxBytes) + ",\"byteLength\":" + texBytes + "}";
+            json += "]";
+            json += ",\"buffers\":[{\"byteLength\":" + binTotal + "}]";
+            json += ",\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":1.0}";
+            if (texBytes > 0) json += ",\"baseColorTexture\":{\"index\":0}";
+            json += "}}]";
+            if (texBytes > 0)
+            {
+                json += ",\"textures\":[{\"source\":0}]";
+                json += ",\"images\":[{\"mimeType\":\"image/png\",\"bufferView\":" + bvTex + "}]";
+                json += ",\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987}]";
+            }
+            json += "}";
+
+            byte[] jsonBytes = Encoding.UTF8.GetBytes(json);
+            int jsonPadded = Align4(jsonBytes.Length);
+            int binPadded = Align4(binTotal);
+
+            int totalLen = 12 + 8 + jsonPadded + 8 + binPadded;
+            var result = new byte[totalLen];
+            int pos = 0;
+
+            WriteUint(result, ref pos, 0x46546C67);
+            WriteUint(result, ref pos, 2);
+            WriteUint(result, ref pos, (uint)totalLen);
+
+            WriteUint(result, ref pos, (uint)jsonPadded);
+            WriteUint(result, ref pos, 0x4E4F534A);
+            Array.Copy(jsonBytes, 0, result, pos, jsonBytes.Length);
+            pos += jsonPadded;
+
+            WriteUint(result, ref pos, (uint)binPadded);
+            WriteUint(result, ref pos, 0x004E4942);
+
+            int binStart = pos;
+            for (int i = 0; i < vertices.Length; i++)
+            {
+                WriteFloat(result, ref pos, vertices[i].x);
+                WriteFloat(result, ref pos, vertices[i].y);
+                WriteFloat(result, ref pos, vertices[i].z);
+            }
+            for (int i = 0; i < normals.Length; i++)
+            {
+                WriteFloat(result, ref pos, normals[i].x);
+                WriteFloat(result, ref pos, normals[i].y);
+                WriteFloat(result, ref pos, normals[i].z);
+            }
+            for (int i = 0; i < uv.Length; i++)
+            {
+                WriteFloat(result, ref pos, uv[i].x);
+                WriteFloat(result, ref pos, uv[i].y);
+            }
+            if (useUint32)
+            {
+                for (int i = 0; i < triangles.Length; i++)
+                    WriteUint(result, ref pos, (uint)triangles[i]);
+            }
+            else
+            {
+                for (int i = 0; i < triangles.Length; i++)
+                    WriteUshort(result, ref pos, (ushort)triangles[i]);
+            }
+            if (texBytes > 0)
+            {
+                Array.Copy(texPng, 0, result, pos, texPng.Length);
+                pos += texBytes;
+            }
+
+            return result;
+        }
+
+        static int Align4(int v) { return (v + 3) & ~3; }
+
+        static void WriteUint(byte[] buf, ref int pos, uint v)
+        {
+            buf[pos] = (byte)(v & 0xFF);
+            buf[pos + 1] = (byte)((v >> 8) & 0xFF);
+            buf[pos + 2] = (byte)((v >> 16) & 0xFF);
+            buf[pos + 3] = (byte)((v >> 24) & 0xFF);
+            pos += 4;
+        }
+
+        static void WriteFloat(byte[] buf, ref int pos, float v)
+        {
+            byte[] b = BitConverter.GetBytes(v);
+            buf[pos] = b[0]; buf[pos + 1] = b[1]; buf[pos + 2] = b[2]; buf[pos + 3] = b[3];
+            pos += 4;
+        }
+
+        static void WriteUshort(byte[] buf, ref int pos, ushort v)
+        {
+            buf[pos] = (byte)(v & 0xFF);
+            buf[pos + 1] = (byte)((v >> 8) & 0xFF);
+            pos += 2;
+        }
+
+        static string F(float v) { return v.ToString("G", System.Globalization.CultureInfo.InvariantCulture); }
+
+        static string EscapeJson(string s) { if (s == null) return ""; return s.Replace("\\", "\\\\").Replace("\"", "\\\""); }
     }
 
     public static class UnityThreadHelper
