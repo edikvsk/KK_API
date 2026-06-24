@@ -109,6 +109,7 @@ namespace StudioHTTPAPI
                     case "/set-camera": body = SetCamera(query); break;
                     case "/add-character": body = AddCharacter(query); break;
                     case "/list-characters": body = ListCharacters(); break;
+                    case "/select-character": body = SelectCharacter(query); break;
                     case "/export-glb": body = ExportGlb(query); break;
                     default: body = "{\"error\":\"not found\"}"; break;
                 }
@@ -319,11 +320,46 @@ namespace StudioHTTPAPI
             catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
         }
 
+        private string SelectCharacter(string query)
+        {
+            var indexStr = GetParam(query, "index") ?? "0";
+            int index; if (!int.TryParse(indexStr, out index)) index = 0;
+            try
+            {
+                var studio = GetStudioInstance();
+                if (ReferenceEquals(studio, null)) return "{\"error\":\"studio not ready\"}";
+                var st = studio.GetType();
+                var dicInfoField = st.GetField("dicInfo", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(dicInfoField, null)) return "{\"error\":\"dicInfo not found\"}";
+                var dic = dicInfoField.GetValue(studio) as System.Collections.IDictionary;
+                if (ReferenceEquals(dic, null) || dic.Count == 0) return "{\"error\":\"no characters in scene\"}";
+
+                var keys = new System.Collections.ArrayList(dic.Keys);
+                if (index < 0 || index >= keys.Count) return "{\"error\":\"index out of range, count:" + keys.Count + "\"}";
+                var node = keys[index];
+
+                var ctrlProp = st.GetProperty("treeNodeCtrl", BindingFlags.Public | BindingFlags.Instance);
+                if (ReferenceEquals(ctrlProp, null)) return "{\"error\":\"treeNodeCtrl not found\"}";
+                var ctrl = ctrlProp.GetValue(studio, null);
+                if (ReferenceEquals(ctrl, null)) return "{\"error\":\"treeNodeCtrl is null\"}";
+
+                var selectProp = ctrl.GetType().GetProperty("selectNode", BindingFlags.Public | BindingFlags.Instance);
+                if (ReferenceEquals(selectProp, null)) return "{\"error\":\"selectNode not found\"}";
+                selectProp.SetValue(ctrl, node, null);
+
+                Log("Selected character index: " + index);
+                return "{\"status\":\"ok\",\"index\":" + index + "}";
+            }
+            catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
+        }
+
         private string ExportGlb(string query)
         {
             var filename = GetParam(query, "filename");
             if (string.IsNullOrEmpty(filename)) filename = "export_" + DateTime.Now.ToString("yyyyMMdd_HHmmss") + ".glb";
             if (!filename.EndsWith(".glb")) filename += ".glb";
+            var indexStr = GetParam(query, "index") ?? "0";
+            int index; if (!int.TryParse(indexStr, out index)) index = 0;
             var dir = UserDataPath("export");
             Directory.CreateDirectory(dir);
             var fullPath = Path.Combine(dir, filename);
@@ -331,8 +367,8 @@ namespace StudioHTTPAPI
 
             try
             {
-                var cc = GetSelectedChaControl();
-                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character selected\"}";
+                var cc = GetChaControlByIndex(index);
+                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character at index " + index + "\"}";
 
                 SkinnedMeshRenderer bodyRenderer = FindBodyRenderer(cc);
                 if (ReferenceEquals(bodyRenderer, null)) return "{\"error\":\"no body mesh found\"}";
@@ -353,6 +389,36 @@ namespace StudioHTTPAPI
                 Log("ExportGlb err: " + ex.GetType().Name + " " + ex.Message);
                 return "{\"error\":\"" + Escape(ex.Message) + "\"}";
             }
+        }
+
+        private ChaControl GetChaControlByIndex(int index)
+        {
+            try
+            {
+                var studio = GetStudioInstance();
+                if (ReferenceEquals(studio, null)) return null;
+                var st = studio.GetType();
+                var dicInfoField = st.GetField("dicInfo", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(dicInfoField, null)) return null;
+                var dic = dicInfoField.GetValue(studio) as System.Collections.IDictionary;
+                if (ReferenceEquals(dic, null) || dic.Count == 0) return null;
+
+                var keys = new System.Collections.ArrayList(dic.Keys);
+                if (index < 0 || index >= keys.Count) return null;
+                var node = keys[index];
+                var info = dic[node];
+                if (ReferenceEquals(info, null)) return null;
+
+                var charInfoField = info.GetType().GetField("charInfo", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(charInfoField, null))
+                {
+                    var cc = charInfoField.GetValue(info) as ChaControl;
+                    if (!ReferenceEquals(cc, null)) return cc;
+                }
+
+                return null;
+            }
+            catch { return null; }
         }
 
         private SkinnedMeshRenderer FindBodyRenderer(ChaControl cc)
