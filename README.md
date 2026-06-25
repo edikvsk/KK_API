@@ -76,13 +76,26 @@ List characters currently in scene.
 curl http://localhost:8080/list-characters
 ```
 
+### POST /select-character
+Select a character by index for subsequent operations.
+```bash
+curl -X POST "http://localhost:8080/select-character?index=0"
+```
+
 ### POST /export-glb
 Export selected character body mesh as GLB (glTF 2.0 Binary) file.
 ```bash
 curl -X POST "http://localhost:8080/export-glb?filename=character.glb"
+curl -X POST "http://localhost:8080/export-glb?filename=character.glb&index=0"
 ```
 
 Files saved to `UserData/export/`. The exported mesh captures the current pose via BakeMesh.
+
+## Known Limitations
+
+- Only body mesh exported (no head, hair, clothing, accessories)
+- Body texture extraction from `Shader Forge/main_skin` RenderTexture produces invalid PNG — texture not yet working
+- GLB file structure is valid but textures need further investigation
 
 ## Python Example
 

@@ -1,0 +1,5 @@
+src = open(r'C:\Games\KK\KKIRV2\BepInEx\plugins\StudioHTTPAPI\StudioHTTPAPI.cs', 'r', encoding='utf-8').read()
+print('Has StringBuilder:', 'var sb = new StringBuilder();' in src)
+print('Has -vertices[i].z:', '-vertices[i].z' in src)
+print('Has triangles[i + 2]:', 'triangles[i + 2]' in src)
+print('Has old pattern:', 'string json = "{"' in src)
