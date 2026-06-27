@@ -18,6 +18,7 @@ namespace StudioHTTPAPI
         private volatile bool isRunning;
         private int port = 8080;
         private static string _logPath;
+        private static Color _exportSkinColor = Color.white;
 
         private void Awake()
         {
@@ -394,7 +395,7 @@ namespace StudioHTTPAPI
                                 ? r.sharedMaterials[0].shader.name : "";
                             if (s != "Shader Forge/main_skin") return true;
                             var n = r.name.ToLower();
-                            if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang")) return true;
+                            if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang") || n.Contains("dankon") || n.Contains("dan_f")) return true;
                             return false;
                         });
                         Log("EXPORT: bodyOnly filtered to " + allRenderers.Count + " renderers");
@@ -405,7 +406,9 @@ namespace StudioHTTPAPI
                     var meshEntries = new System.Collections.Generic.List<MeshEntry>();
                     int texOkCount = 0;
 
-                    byte[] chaFileTex = null;
+                    Color skinColor = GetSkinColorFromChaControl(cc);
+                    _exportSkinColor = skinColor;
+                    byte[] sharedBodyTex = null;
 
                     for (int ri = 0; ri < allRenderers.Count; ri++)
                     {
@@ -417,19 +420,50 @@ namespace StudioHTTPAPI
 
                         byte[] texPng = null;
 
-                        if (ri == 0)
+                        if (bodyOnly && ri == 0)
                         {
-                            chaFileTex = ExtractTextureFromChaFile(cc, ri);
-                            if (chaFileTex != null)
+                            var rawTex = FindRawBodyTexture(cc);
+                            if (!ReferenceEquals(rawTex, null))
                             {
-                                texPng = chaFileTex;
-                                Log("EXPORT: ChaFile texture loaded for " + renderer.name);
+                                var readable = MakeReadable(rawTex);
+                                if (!ReferenceEquals(readable, null))
+                                {
+                                    texPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
+                                    SaveDebugTexture(texPng, "body_raw_texture.png");
+                                    Log("EXPORT: raw body texture " + readable.width + "x" + readable.height + " png=" + texPng.Length);
+                                    UnityEngine.Object.Destroy(readable);
+                                }
+                                else
+                                {
+                                    Log("EXPORT: raw texture not readable, trying RT copy");
+                                    var rt2 = RenderTexture.GetTemporary(rawTex.width, rawTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                                    Graphics.Blit(rawTex, rt2);
+                            var prevActive = RenderTexture.active;
+                                    RenderTexture.active = rt2;
+                                    var t2d = new Texture2D(rawTex.width, rawTex.height, TextureFormat.RGBA32, false);
+                                    t2d.ReadPixels(new Rect(0, 0, rawTex.width, rawTex.height), 0, 0);
+                                    t2d.Apply();
+                            RenderTexture.active = prevActive;
+                                    RenderTexture.ReleaseTemporary(rt2);
+                                    texPng = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
+                                    SaveDebugTexture(texPng, "body_raw_texture.png");
+                                    Log("EXPORT: raw body texture via RT " + t2d.width + "x" + t2d.height + " png=" + texPng.Length);
+                                    UnityEngine.Object.Destroy(t2d);
+                                }
                             }
                         }
-                        else if (chaFileTex != null)
+
+                        if (texPng == null && bodyOnly)
                         {
-                            texPng = chaFileTex;
-                            Log("EXPORT: reusing ChaFile texture for " + renderer.name);
+                            Log("EXPORT: UV bake via unlit for " + renderer.name);
+                            var uvTex = BakeTextureViaUVRender(renderer, resolution);
+                            if (!ReferenceEquals(uvTex, null))
+                            {
+                                texPng = GlbBuilder.EncodePngRaw(uvTex.GetPixels32(), uvTex.width, uvTex.height);
+                                SaveDebugTexture(texPng, "body_uvbake_debug.png");
+                                Log("EXPORT: UV bake produced " + uvTex.width + "x" + uvTex.height + " png=" + texPng.Length);
+                                UnityEngine.Object.Destroy(uvTex);
+                            }
                         }
 
                         if (texPng == null)
@@ -439,13 +473,7 @@ namespace StudioHTTPAPI
 
                         if (texPng == null)
                         {
-                            Log("EXPORT: all extract failed for " + renderer.name + ", trying UV bake");
-                            var uvTex = BakeTextureViaUVRender(renderer, resolution);
-                            if (!ReferenceEquals(uvTex, null))
-                            {
-                                texPng = GlbBuilder.EncodePngRaw(uvTex.GetPixels32(), uvTex.width, uvTex.height);
-                                UnityEngine.Object.Destroy(uvTex);
-                            }
+                            Log("EXPORT: all extract failed for " + renderer.name);
                         }
 
                         if (texPng != null) texOkCount++;
@@ -632,6 +660,84 @@ namespace StudioHTTPAPI
             catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
         }
 
+        private byte[] ExtractTextureFromRenderTexture(RenderTexture rt, int resolution)
+        {
+            try
+            {
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var t2d = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
+                t2d.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+                t2d.Apply();
+                RenderTexture.active = prev;
+                var png = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
+                UnityEngine.Object.Destroy(t2d);
+                Log("TEX: camera RT read " + rt.width + "x" + rt.height + " png=" + png.Length);
+                return png;
+            }
+            catch (Exception ex) { Log("TEX: camera RT read failed: " + ex.Message); return null; }
+        }
+
+        private RenderTexture RenderBodyViaCamera(ChaControl cc, System.Collections.Generic.List<SkinnedMeshRenderer> bodyRenderers, int resolution)
+        {
+            try
+            {
+                Bounds bodyBounds = bodyRenderers[0].bounds;
+                for (int i = 1; i < bodyRenderers.Count; i++)
+                    bodyBounds.Encapsulate(bodyRenderers[i].bounds);
+
+                Vector3 center = bodyBounds.center;
+                float size = bodyBounds.extents.y * 2.5f;
+                if (size < 0.1f) size = 1f;
+
+                var rt = RenderTexture.GetTemporary(resolution, resolution, 24, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+
+                var camObj = new GameObject("_BodyCaptureCam");
+                var cam = camObj.AddComponent<Camera>();
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = new Color(0, 0, 0, 0);
+                cam.orthographic = true;
+                cam.orthographicSize = size;
+                cam.nearClipPlane = 0.01f;
+                cam.farClipPlane = 100f;
+                cam.transform.position = center + new Vector3(0, 0, -size * 4);
+                cam.transform.LookAt(center);
+                cam.targetTexture = rt;
+
+                cam.Render();
+
+                var result = new RenderTexture(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(rt, result);
+
+                UnityEngine.Object.DestroyImmediate(camObj);
+                RenderTexture.ReleaseTemporary(rt);
+
+                Log("TEX: body camera render done " + resolution + "x" + resolution);
+                return result;
+            }
+            catch (Exception ex) { Log("TEX: body camera render failed: " + ex.GetType().Name + " " + ex.Message); return null; }
+        }
+
+        private void SetLayerRecursive(GameObject go, int layer)
+        {
+            go.layer = layer;
+            for (int i = 0; i < go.transform.childCount; i++)
+                SetLayerRecursive(go.transform.GetChild(i).gameObject, layer);
+        }
+
+        private void SaveDebugTexture(byte[] pngData, string filename)
+        {
+            try
+            {
+                var dir = UserDataPath("export");
+                Directory.CreateDirectory(dir);
+                var path = Path.Combine(dir, filename);
+                File.WriteAllBytes(path, pngData);
+                Log("DEBUG: saved " + path + " (" + pngData.Length + " bytes)");
+            }
+            catch (Exception ex) { Log("DEBUG: save failed: " + ex.Message); }
+        }
+
         private ChaControl GetChaControlByIndex(int index)
         {
             try
@@ -718,33 +824,50 @@ namespace StudioHTTPAPI
                 uvMesh.vertices = uvVerts;
                 uvMesh.triangles = bakedMesh.triangles;
                 uvMesh.uv = srcUV;
-                var norms = bakedMesh.normals;
-                if (norms != null && norms.Length == vertCount)
-                {
-                    var camNorms = new Vector3[vertCount];
-                    for (int i = 0; i < vertCount; i++) camNorms[i] = new Vector3(0, 0, -1);
-                    uvMesh.normals = camNorms;
-                }
+                var camNorms = new Vector3[vertCount];
+                for (int i = 0; i < vertCount; i++) camNorms[i] = new Vector3(0, 0, -1);
+                uvMesh.normals = camNorms;
                 uvMesh.RecalculateBounds();
+
+                int uvLayer = 30;
 
                 var rt = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
                 var camObj = new GameObject("_UVBakeCam_" + renderer.name);
                 var cam = camObj.AddComponent<Camera>();
                 cam.orthographic = true;
-                cam.orthographicSize = 0.55f;
+                cam.orthographicSize = 0.5f;
                 cam.transform.position = new Vector3(0.5f, 0.5f, -10);
                 cam.transform.LookAt(new Vector3(0.5f, 0.5f, 0));
                 cam.backgroundColor = new Color(0, 0, 0, 0);
                 cam.clearFlags = CameraClearFlags.SolidColor;
                 cam.targetTexture = rt;
-                cam.cullingMask = -1;
+                cam.cullingMask = 1 << uvLayer;
                 cam.depth = -999;
 
                 var meshObj = new GameObject("_UVBakeObj_" + renderer.name);
+                meshObj.layer = uvLayer;
                 var mf = meshObj.AddComponent<MeshFilter>();
                 mf.mesh = uvMesh;
                 var mr = meshObj.AddComponent<MeshRenderer>();
-                mr.sharedMaterial = renderer.sharedMaterials.Length > 0 ? renderer.sharedMaterials[0] : null;
+
+                var unlitShader = Shader.Find("Unlit/Texture");
+                if (ReferenceEquals(unlitShader, null)) unlitShader = Shader.Find("Sprites/Default");
+                var bakeMat = new Material(unlitShader);
+
+                var srcTex = renderer.sharedMaterials.Length > 0 && !ReferenceEquals(renderer.sharedMaterials[0], null)
+                    ? renderer.sharedMaterials[0].mainTexture : null;
+                if (!ReferenceEquals(srcTex, null) && srcTex is RenderTexture srcRT)
+                {
+                    var tmp = RenderTexture.GetTemporary(srcRT.width, srcRT.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                    Graphics.Blit(srcRT, tmp);
+                    bakeMat.mainTexture = tmp;
+                }
+                else if (!ReferenceEquals(srcTex, null))
+                {
+                    bakeMat.mainTexture = srcTex;
+                }
+
+                mr.sharedMaterial = bakeMat;
 
                 cam.Render();
 
@@ -759,6 +882,7 @@ namespace StudioHTTPAPI
                 UnityEngine.Object.DestroyImmediate(camObj);
                 UnityEngine.Object.DestroyImmediate(meshObj);
                 UnityEngine.Object.DestroyImmediate(uvMesh);
+                UnityEngine.Object.DestroyImmediate(bakeMat);
 
                 Log("TEX: UV bake done " + tex.width + "x" + tex.height + " for " + renderer.name);
                 return tex;
@@ -770,12 +894,27 @@ namespace StudioHTTPAPI
         {
             try
             {
-                var mainTex = material.mainTexture;
-                if (ReferenceEquals(mainTex, null)) { Log("TEX: composite mainTex null"); return null; }
+                Texture srcTex = null;
+                string[] baseNames = { "_ColorTex", "_MainTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap", "_SkinTex", "_BodyTex" };
+                foreach (var bn in baseNames)
+                {
+                    var t = material.GetTexture(bn);
+                    if (!ReferenceEquals(t, null))
+                    {
+                        srcTex = t;
+                        Log("TEX: composite source=" + bn);
+                        break;
+                    }
+                }
+                if (ReferenceEquals(srcTex, null))
+                {
+                    srcTex = material.mainTexture;
+                    if (ReferenceEquals(srcTex, null)) { Log("TEX: composite no source"); return null; }
+                }
 
                 var tempMat = new Material(material);
                 var rt = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                Graphics.Blit(mainTex, rt, tempMat);
+                Graphics.Blit(srcTex, rt, tempMat);
 
                 var prev = RenderTexture.active;
                 RenderTexture.active = rt;
@@ -792,6 +931,263 @@ namespace StudioHTTPAPI
             catch (Exception ex) { Log("TEX: composite failed: " + ex.Message); return null; }
         }
 
+        private void DumpMaterialTextures(Material mat, int matIndex)
+        {
+            try
+            {
+                var shader = mat.shader;
+                Log("TEX: shader=" + shader.name);
+
+                string[] knownProps = {
+                    "_MainTex", "_ColorTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap",
+                    "_ShadowTex", "_DetailTex", "_DetailMask", "_SubTex",
+                    "_NormalTex", "_BumpTex", "_SpecularTex", "_RampTex",
+                    "_ShadowColorMultiplyTex", "_ShadowColorTexture",
+                    "_TexID", "_MainTex2", "_Diffuse", "_Albedo",
+                    "_SkinTex", "_BodyTex", "_BodyTex2", "_FaceTex",
+                    "_HairTex", "_AccessTex", "_ColorMask", "_SubMask",
+                    "_DetailMask2", "_EyeTex", "_EyeHiTex", "_EyeHighLightTex",
+                    "_GradientTex", "_MetallicGlossMap", "_OcclusionMap",
+                    "_EmissionMap", "_BumpMap", "_ParallaxMap",
+                    "_lightMap", "_MaskTex", "_AlphaMask",
+                    "_colorTex", "_shadowTex", "_detailTex", "_subTex",
+                    "_tex1", "_tex2", "_texture",
+                    "_ReflectionTex", "_GrabTexture",
+                    "_EyehlUpTex", "_EyeHiUpTex", "_EyeHLUpTex"
+                };
+
+                int foundCount = 0;
+                foreach (var pn in knownProps)
+                {
+                    var t = mat.GetTexture(pn);
+                    if (!ReferenceEquals(t, null))
+                    {
+                        Log("TEX: mat[" + matIndex + "] " + pn + " = " + t.GetType().Name + " " + t.width + "x" + t.height + " name=" + t.name);
+                        foundCount++;
+                    }
+                }
+
+                if (foundCount == 0)
+                {
+                    Log("TEX: mat[" + matIndex + "] no textures found in known properties, trying ShaderUtil...");
+                    try
+                    {
+                        var shaderUtilType = FindType("UnityEditor.ShaderUtil");
+                        if (!ReferenceEquals(shaderUtilType, null))
+                        {
+                            var propCountMethod = shaderUtilType.GetMethod("GetPropertyCount", BindingFlags.Public | BindingFlags.Static);
+                            if (!ReferenceEquals(propCountMethod, null))
+                            {
+                                int count = (int)propCountMethod.Invoke(null, new object[] { shader });
+                                Log("TEX: ShaderUtil reports " + count + " properties");
+                                for (int pi = 0; pi < count; pi++)
+                                {
+                                    var nameMethod = shaderUtilType.GetMethod("GetPropertyName", BindingFlags.Public | BindingFlags.Static);
+                                    var typeMethod = shaderUtilType.GetMethod("GetPropertyType", BindingFlags.Public | BindingFlags.Static);
+                                    if (!ReferenceEquals(nameMethod, null) && !ReferenceEquals(typeMethod, null))
+                                    {
+                                        var propName = (string)nameMethod.Invoke(null, new object[] { shader, pi });
+                                        var propType = typeMethod.Invoke(null, new object[] { shader, pi });
+                                        var propTypeStr = propType.ToString();
+                                        Log("TEX: prop[" + pi + "] name=" + propName + " type=" + propTypeStr);
+                                        if (propTypeStr.Contains("Tex") || propTypeStr.Contains("Texture"))
+                                        {
+                                            var t = mat.GetTexture(propName);
+                                            if (!ReferenceEquals(t, null))
+                                                Log("TEX:   -> " + t.GetType().Name + " " + t.width + "x" + t.height);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    catch (Exception ex) { Log("TEX: ShaderUtil reflection failed: " + ex.Message); }
+                }
+            }
+            catch (Exception ex) { Log("TEX: DumpMaterialTextures error: " + ex.Message); }
+        }
+
+        private Texture2D FindRawBodyTexture(ChaControl cc)
+        {
+            try
+            {
+                var ccType = cc.GetType();
+
+                var prop = ccType.GetProperty("customTexCtrlBody", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(prop, null))
+                {
+                    foreach (var p in ccType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    {
+                        if (p.Name.ToLower().Contains("customtex") && p.Name.ToLower().Contains("body"))
+                        {
+                            prop = p;
+                            Log("TEX: found customTexCtrlBody via search: " + p.Name);
+                            break;
+                        }
+                    }
+                }
+
+                if (ReferenceEquals(prop, null)) { Log("TEX: customTexCtrlBody not found"); return null; }
+
+                var texCtrl = prop.GetValue(cc, null);
+                if (ReferenceEquals(texCtrl, null)) { Log("TEX: customTexCtrlBody is null"); return null; }
+
+                Log("TEX: customTexCtrlBody type=" + texCtrl.GetType().FullName);
+
+                foreach (var f in texCtrl.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    try
+                    {
+                        var val = f.GetValue(texCtrl);
+                        if (ReferenceEquals(val, null)) continue;
+                        var valType = val.GetType().Name;
+                        if (typeof(Texture).IsAssignableFrom(f.FieldType))
+                        {
+                            var tex = val as Texture;
+                            if (!ReferenceEquals(tex, null))
+                                Log("TEX: field " + f.Name + " = Texture " + tex.width + "x" + tex.height);
+                        }
+                        else if (f.FieldType.Name.Contains("Material") || f.FieldType.Name.Contains("Mat"))
+                        {
+                            var mat = val as Material;
+                            if (!ReferenceEquals(mat, null))
+                            {
+                                Log("TEX: field " + f.Name + " = Material shader=" + mat.shader.name);
+                                var mainTex = mat.mainTexture;
+                                if (!ReferenceEquals(mainTex, null))
+                                    Log("TEX:   mainTexture=" + mainTex.width + "x" + mainTex.height + " type=" + mainTex.GetType().Name);
+                            }
+                        }
+                        else
+                        {
+                            Log("TEX: field " + f.Name + " = " + valType);
+                        }
+                    }
+                    catch { }
+                }
+
+                foreach (var p in texCtrl.GetType().GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    try
+                    {
+                        var val = p.GetValue(texCtrl, null);
+                        if (ReferenceEquals(val, null)) continue;
+                        if (typeof(Texture).IsAssignableFrom(p.PropertyType))
+                        {
+                            var tex = val as Texture;
+                            if (!ReferenceEquals(tex, null))
+                                Log("TEX: prop " + p.Name + " = Texture " + tex.width + "x" + tex.height);
+                        }
+                        else if (p.PropertyType.Name.Contains("Material") || p.PropertyType.Name.Contains("Mat"))
+                        {
+                            var mat = val as Material;
+                            if (!ReferenceEquals(mat, null))
+                                Log("TEX: prop " + p.Name + " = Material shader=" + mat.shader.name);
+                        }
+                        else
+                        {
+                            Log("TEX: prop " + p.Name + " = " + p.PropertyType.Name);
+                        }
+                    }
+                    catch { }
+                }
+
+                Texture bestTex = null;
+                int bestSize = 0;
+
+                var texMainField = texCtrl.GetType().GetField("texMain", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(texMainField, null))
+                {
+                    var t = texMainField.GetValue(texCtrl) as Texture;
+                    if (!ReferenceEquals(t, null))
+                    {
+                        var rt2 = RenderTexture.GetTemporary(t.width, t.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                        GL.Clear(false, true, new Color(0, 0, 0, 0));
+                        Graphics.Blit(t, rt2);
+                        RenderTexture.active = rt2;
+                        var testPix = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                        testPix.ReadPixels(new Rect(0, 0, 4, 4), 0, 0);
+                        testPix.Apply();
+                        RenderTexture.active = null;
+                        RenderTexture.ReleaseTemporary(rt2);
+                        var px = testPix.GetPixel(2, 2);
+                        UnityEngine.Object.DestroyImmediate(testPix);
+                        Log("TEX: texMain sample color=" + px);
+                        if (px.a > 0.01f && (px.r + px.g + px.b) > 0.1f && !(px.r > 0.99f && px.g > 0.99f && px.b > 0.99f)) bestTex = t;
+                        else Log("TEX: texMain is empty, trying matCreate...");
+                    }
+                }
+
+                if (ReferenceEquals(bestTex, null))
+                {
+                    var matCreateField = texCtrl.GetType().GetField("matCreate", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    var createTexField = texCtrl.GetType().GetField("createTex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (!ReferenceEquals(matCreateField, null) && !ReferenceEquals(createTexField, null))
+                    {
+                        var matCreate = matCreateField.GetValue(texCtrl) as Material;
+                        var createTex = createTexField.GetValue(texCtrl) as Texture;
+                        if (!ReferenceEquals(matCreate, null) && !ReferenceEquals(createTex, null))
+                        {
+                            Log("TEX: matCreate shader=" + matCreate.shader.name + " createTex=" + createTex.width + "x" + createTex.height);
+                            var composed = new RenderTexture(createTex.width, createTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                            Graphics.Blit(createTex, composed, matCreate);
+                            var prevComp = RenderTexture.active;
+                            RenderTexture.active = composed;
+                            bestTex = new Texture2D(composed.width, composed.height, TextureFormat.RGBA32, false);
+                            ((Texture2D)bestTex).ReadPixels(new Rect(0, 0, composed.width, composed.height), 0, 0);
+                            ((Texture2D)bestTex).Apply();
+                            RenderTexture.active = prevComp;
+                            RenderTexture.ReleaseTemporary(composed);
+                            Log("TEX: matCreate composited " + bestTex.width + "x" + bestTex.height);
+                            return bestTex as Texture2D;
+                        }
+                    }
+                }
+
+                if (ReferenceEquals(bestTex, null))
+                {
+                    foreach (var f in texCtrl.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    {
+                        try
+                        {
+                            if (!typeof(Texture).IsAssignableFrom(f.FieldType)) continue;
+                            var tex = f.GetValue(texCtrl) as Texture;
+                            if (ReferenceEquals(tex, null) || tex.width < 256) continue;
+                            if (tex.width * tex.height > bestSize)
+                            {
+                                bestTex = tex;
+                                bestSize = tex.width * tex.height;
+                                Log("TEX: fallback texture: " + f.Name + " " + tex.width + "x" + tex.height);
+                            }
+                        }
+                        catch { }
+                    }
+                }
+
+                if (ReferenceEquals(bestTex, null))
+                {
+                    Log("TEX: no suitable texture found on customTexCtrlBody");
+                    return null;
+                }
+
+                if (bestTex is Texture2D t2d) return t2d;
+
+                var rt = RenderTexture.GetTemporary(bestTex.width, bestTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                GL.Clear(false, true, new Color(0, 0, 0, 0));
+                Graphics.Blit(bestTex, rt);
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var readable = new Texture2D(bestTex.width, bestTex.height, TextureFormat.RGBA32, false);
+                readable.ReadPixels(new Rect(0, 0, bestTex.width, bestTex.height), 0, 0);
+                readable.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+                Log("TEX: texture converted " + readable.width + "x" + readable.height);
+                return readable;
+            }
+            catch (Exception ex) { Log("TEX: FindRawBodyTexture error: " + ex.GetType().Name + " " + ex.Message); return null; }
+        }
+
         private byte[] ExtractTextureForRenderer(SkinnedMeshRenderer renderer, int resolution)
         {
             try
@@ -806,6 +1202,25 @@ namespace StudioHTTPAPI
 
                     Log("TEX: renderer=" + renderer.name + " mat[" + mi + "] shader=" + mat.shader.name);
 
+                    DumpMaterialTextures(mat, mi);
+
+                    if (!ReferenceEquals(mat.GetTexture("_DetailMask"), null))
+                    {
+                        var dm = mat.GetTexture("_DetailMask");
+                        var dm2d = dm as Texture2D;
+                        if (!ReferenceEquals(dm2d, null))
+                        {
+                            var readable = MakeReadable(dm2d);
+                            if (!ReferenceEquals(readable, null))
+                            {
+                                var dmPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
+                                SaveDebugTexture(dmPng, "detail_mask_" + renderer.name + ".png");
+                                UnityEngine.Object.Destroy(readable);
+                                Log("TEX: _DetailMask saved: " + dm.name + " " + dm.width + "x" + dm.height);
+                            }
+                        }
+                    }
+
                     if (!ReferenceEquals(mat.mainTexture, null))
                     {
                         if (mat.mainTexture is RenderTexture rt)
@@ -813,7 +1228,32 @@ namespace StudioHTTPAPI
                             int w = Math.Min(rt.width, resolution);
                             int h = Math.Min(rt.height, resolution);
                             var dst = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                            Graphics.Blit(rt, dst);
+
+                            Texture2D baseTex2d = null;
+                            string[] baseNames = { "_ColorTex", "_MainTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap", "_SkinTex", "_BodyTex", "_SubTex" };
+                            foreach (var bn in baseNames)
+                            {
+                                var bt = mat.GetTexture(bn);
+                                if (!ReferenceEquals(bt, null) && !(bt is RenderTexture))
+                                {
+                                    baseTex2d = bt as Texture2D;
+                                    if (!ReferenceEquals(baseTex2d, null)) { Log("TEX: base texture found: " + bn + " " + baseTex2d.width + "x" + baseTex2d.height); break; }
+                                }
+                            }
+
+                            if (!ReferenceEquals(baseTex2d, null))
+                            {
+                                var tempMat = new Material(mat);
+                                Graphics.Blit(baseTex2d, dst, tempMat);
+                                UnityEngine.Object.DestroyImmediate(tempMat);
+                                Log("TEX: composited via shader from " + baseTex2d.name);
+                            }
+                            else
+                            {
+                                Graphics.Blit(rt, dst);
+                                Log("TEX: RenderTexture copy");
+                            }
+
                             var prev = RenderTexture.active;
                             RenderTexture.active = dst;
                             var t2d = new Texture2D(w, h, TextureFormat.RGBA32, false);
@@ -821,9 +1261,10 @@ namespace StudioHTTPAPI
                             t2d.Apply();
                             RenderTexture.active = prev;
                             RenderTexture.ReleaseTemporary(dst);
+
                             var png = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
                             UnityEngine.Object.Destroy(t2d);
-                            Log("TEX: RenderTexture extracted " + w + "x" + h);
+                            Log("TEX: extracted " + w + "x" + h);
                             return png;
                         }
 
@@ -1042,6 +1483,91 @@ namespace StudioHTTPAPI
             }
             catch (Exception ex) { Log("TEX: error " + ex.GetType().Name + " " + ex.Message); }
             return null;
+        }
+
+        private Texture2D MakeReadable(Texture2D tex)
+        {
+            try
+            {
+                var rt = RenderTexture.GetTemporary(tex.width, tex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(tex, rt);
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var readable = new Texture2D(tex.width, tex.height, TextureFormat.RGBA32, false);
+                readable.ReadPixels(new Rect(0, 0, tex.width, tex.height), 0, 0);
+                readable.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+                return readable;
+            }
+            catch { return null; }
+        }
+
+        private void RemoveSkinColorOverlay(Texture2D tex, Color skinMainColor)
+        {
+            try
+            {
+                if (skinMainColor.r < 0.01f || skinMainColor.g < 0.01f || skinMainColor.b < 0.01f) return;
+                var pixels = tex.GetPixels32();
+                float invR = 1.0f / Math.Max(skinMainColor.r, 0.01f);
+                float invG = 1.0f / Math.Max(skinMainColor.g, 0.01f);
+                float invB = 1.0f / Math.Max(skinMainColor.b, 0.01f);
+                for (int i = 0; i < pixels.Length; i++)
+                {
+                    float r = pixels[i].r * invR;
+                    float g = pixels[i].g * invG;
+                    float b = pixels[i].b * invB;
+                    pixels[i].r = (byte)Math.Min(255, (int)(r * 255));
+                    pixels[i].g = (byte)Math.Min(255, (int)(g * 255));
+                    pixels[i].b = (byte)Math.Min(255, (int)(b * 255));
+                }
+                tex.SetPixels32(pixels);
+                tex.Apply();
+                Log("TEX: skin color removed r=" + skinMainColor.r + " g=" + skinMainColor.g + " b=" + skinMainColor.b);
+            }
+            catch (Exception ex) { Log("TEX: removeSkinColor error: " + ex.Message); }
+        }
+
+        private Color GetSkinColorFromChaControl(ChaControl cc)
+        {
+            try
+            {
+                var chaFileProp = cc.GetType().GetProperty("chaFile", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(chaFileProp, null)) return Color.white;
+                var chaFile = chaFileProp.GetValue(cc, null);
+                if (ReferenceEquals(chaFile, null)) return Color.white;
+
+                var customField = chaFile.GetType().GetField("custom", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(customField, null)) return Color.white;
+                var custom = customField.GetValue(chaFile);
+                if (ReferenceEquals(custom, null)) return Color.white;
+
+                var bodyField = custom.GetType().GetField("body", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(bodyField, null)) return Color.white;
+                var body = bodyField.GetValue(custom);
+                if (ReferenceEquals(body, null)) return Color.white;
+
+                var colorField = body.GetType().GetField("<skinMainColor>k__BackingField", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(colorField, null))
+                {
+                    var color = (Color)colorField.GetValue(body);
+                    Log("TEX: skinMainColor from ChaFile = " + color);
+                    return color;
+                }
+
+                foreach (var f in body.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    if (f.FieldType.Equals(typeof(Color)) && f.Name.ToLower().Contains("skin") && f.Name.ToLower().Contains("color"))
+                    {
+                        var c = (Color)f.GetValue(body);
+                        Log("TEX: found skin color field: " + f.Name + " = " + c);
+                        return c;
+                    }
+                }
+
+                return Color.white;
+            }
+            catch (Exception ex) { Log("TEX: GetSkinColor error: " + ex.Message); return Color.white; }
         }
 
         private byte[] ExtractTextureFromChaFile(ChaControl cc, int rendererIndex)
