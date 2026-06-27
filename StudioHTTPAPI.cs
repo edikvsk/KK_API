@@ -111,6 +111,7 @@ namespace StudioHTTPAPI
                     case "/list-characters": body = ListCharacters(); break;
                     case "/select-character": body = SelectCharacter(query); break;
                     case "/export-glb": body = ExportGlb(query); break;
+                    case "/debug-chafile": body = DebugChaFile(query); break;
                     default: body = "{\"error\":\"not found\"}"; break;
                 }
                 var bodyBytes = Encoding.UTF8.GetBytes(body);
@@ -360,12 +361,16 @@ namespace StudioHTTPAPI
             if (!filename.EndsWith(".glb")) filename += ".glb";
             var indexStr = GetParam(query, "index") ?? "0";
             int index; if (!int.TryParse(indexStr, out index)) index = 0;
+            var resStr = GetParam(query, "resolution") ?? "2048";
+            int resolution; if (!int.TryParse(resStr, out resolution) || resolution < 256) resolution = 2048;
+            if (resolution > 4096) resolution = 4096;
+            var bodyOnlyStr = GetParam(query, "bodyOnly");
+            bool bodyOnly = bodyOnlyStr == "true" || bodyOnlyStr == "1";
             var dir = UserDataPath("export");
             Directory.CreateDirectory(dir);
             var fullPath = Path.Combine(dir, filename);
             var capturedPath = fullPath;
 
-            var resultLock = new object();
             string resultJson = null;
             byte[] resultGlb = null;
 
@@ -378,73 +383,85 @@ namespace StudioHTTPAPI
                     var cc = GetChaControlByIndex(index);
                     if (ReferenceEquals(cc, null)) { resultJson = "{\"error\":\"no character at index " + index + "\"}"; done.Set(); return; }
 
-                    SkinnedMeshRenderer bodyRenderer = FindBodyRenderer(cc);
-                    if (ReferenceEquals(bodyRenderer, null)) { resultJson = "{\"error\":\"no body mesh found\"}"; done.Set(); return; }
+                    var allRenderers = FindAllRenderers(cc);
+                    Log("EXPORT: found " + allRenderers.Count + " renderers");
 
-                    Mesh bakedMesh = new Mesh();
-                    bodyRenderer.BakeMesh(bakedMesh);
-
-                    Texture2D bodyTexture = null;
-                byte[] texPngBytes = null;
-                    try
+                    if (bodyOnly)
                     {
-                        var mats = bodyRenderer.sharedMaterials;
-                        Log("TEX: matCount=" + mats.Length);
-                        for (int mi = 0; mi < mats.Length && ReferenceEquals(bodyTexture, null); mi++)
+                        allRenderers.RemoveAll(r =>
                         {
-                            var mat = mats[mi];
-                            if (ReferenceEquals(mat, null)) { Log("TEX: mat[" + mi + "] null"); continue; }
-                            Log("TEX: mat[" + mi + "] shader=" + mat.shader.name);
-                            var mainTex = mat.mainTexture;
-                            if (ReferenceEquals(mainTex, null)) { Log("TEX: mat[" + mi + "] mainTexture null"); continue; }
-                            Log("TEX: mat[" + mi + "] mainTex type=" + mainTex.GetType().Name + " " + mainTex.width + "x" + mainTex.height);
+                            var s = r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null)
+                                ? r.sharedMaterials[0].shader.name : "";
+                            if (s != "Shader Forge/main_skin") return true;
+                            var n = r.name.ToLower();
+                            if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang")) return true;
+                            return false;
+                        });
+                        Log("EXPORT: bodyOnly filtered to " + allRenderers.Count + " renderers");
+                    }
 
-                            if (mainTex is RenderTexture rt)
+                    if (allRenderers.Count == 0) { resultJson = "{\"error\":\"no renderers found\"}"; done.Set(); return; }
+
+                    var meshEntries = new System.Collections.Generic.List<MeshEntry>();
+                    int texOkCount = 0;
+
+                    byte[] chaFileTex = null;
+
+                    for (int ri = 0; ri < allRenderers.Count; ri++)
+                    {
+                        var renderer = allRenderers[ri];
+                        Log("EXPORT: [" + ri + "/" + allRenderers.Count + "] " + renderer.name + " verts=" + renderer.sharedMesh.vertexCount);
+
+                        Mesh bakedMesh = new Mesh();
+                        renderer.BakeMesh(bakedMesh);
+
+                        byte[] texPng = null;
+
+                        if (ri == 0)
+                        {
+                            chaFileTex = ExtractTextureFromChaFile(cc, ri);
+                            if (chaFileTex != null)
                             {
-                                int w = Math.Min(rt.width, 512);
-                                int h = Math.Min(rt.height, 512);
-                                var dst = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32);
-                                Graphics.Blit(mainTex, dst);
-                                var prev = RenderTexture.active;
-                                RenderTexture.active = dst;
-                                bodyTexture = new Texture2D(w, h, TextureFormat.RGBA32, false);
-                                bodyTexture.ReadPixels(new Rect(0, 0, w, h), 0, 0);
-                                bodyTexture.Apply();
-                                RenderTexture.active = prev;
-                                RenderTexture.ReleaseTemporary(dst);
-                                var px = bodyTexture.GetPixels32();
-                                Log("TEX: px[0]=" + px[0].r + "," + px[0].g + "," + px[0].b + "," + px[0].a);
-                                var rawPng = GlbBuilder.EncodePngRaw(px, w, h);
-                                byte[] pngSig = { 0x89, 0x50, 0x4E, 0x47 };
-                                int strip = -1;
-                                for (int i = 0; i <= rawPng.Length - 4; i++)
-                                {
-                                    if (rawPng[i] == pngSig[0] && rawPng[i+1] == pngSig[1] && rawPng[i+2] == pngSig[2] && rawPng[i+3] == pngSig[3])
-                                    { strip = i; break; }
-                                }
-                                Log("TEX: rawPng len=" + rawPng.Length + " strip=" + strip + " first=" + rawPng[0].ToString("X2") + rawPng[1].ToString("X2"));
-                                if (strip >= 0)
-                                {
-                                    var clean = new byte[rawPng.Length - strip];
-                                    Array.Copy(rawPng, strip, clean, 0, clean.Length);
-                                    texPngBytes = clean;
-                                    Log("TEX: clean PNG len=" + texPngBytes.Length + " first=" + texPngBytes[0].ToString("X2") + texPngBytes[1].ToString("X2"));
-                                }
-                                else { texPngBytes = rawPng; Log("TEX: no strip, using raw"); }
-                                Log("TEX: PNG strip=" + strip + " len=" + texPngBytes.Length);
-                            }
-                            else if (mainTex is Texture2D t2d)
-                            {
-                                bodyTexture = t2d;
-                                texPngBytes = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
-                                Log("TEX: using Texture2D " + t2d.width + "x" + t2d.height);
+                                texPng = chaFileTex;
+                                Log("EXPORT: ChaFile texture loaded for " + renderer.name);
                             }
                         }
-                    }
-                    catch (Exception texEx) { Log("TEX: error " + texEx.GetType().Name + " " + texEx.Message); }
+                        else if (chaFileTex != null)
+                        {
+                            texPng = chaFileTex;
+                            Log("EXPORT: reusing ChaFile texture for " + renderer.name);
+                        }
 
-                    resultGlb = GlbBuilder.Build(bakedMesh, texPngBytes, "body");
-                    resultJson = "{\"status\":\"ok\",\"path\":\"" + Escape(capturedPath) + "\",\"size\":" + resultGlb.Length + ",\"texLen\":" + (texPngBytes != null ? texPngBytes.Length : 0) + "}";
+                        if (texPng == null)
+                        {
+                            texPng = ExtractTextureForRenderer(renderer, resolution);
+                        }
+
+                        if (texPng == null)
+                        {
+                            Log("EXPORT: all extract failed for " + renderer.name + ", trying UV bake");
+                            var uvTex = BakeTextureViaUVRender(renderer, resolution);
+                            if (!ReferenceEquals(uvTex, null))
+                            {
+                                texPng = GlbBuilder.EncodePngRaw(uvTex.GetPixels32(), uvTex.width, uvTex.height);
+                                UnityEngine.Object.Destroy(uvTex);
+                            }
+                        }
+
+                        if (texPng != null) texOkCount++;
+
+                        meshEntries.Add(new MeshEntry
+                        {
+                            mesh = bakedMesh,
+                            pngData = texPng,
+                            name = renderer.name
+                        });
+
+                        Log("EXPORT: " + renderer.name + " tex=" + (texPng != null ? texPng.Length + "b" : "none"));
+                    }
+
+                    resultGlb = GlbBuilder.BuildMulti(meshEntries);
+                    resultJson = "{\"status\":\"ok\",\"path\":\"" + Escape(capturedPath) + "\",\"size\":" + resultGlb.Length + ",\"meshCount\":" + meshEntries.Count + ",\"texturedCount\":" + texOkCount + ",\"resolution\":" + resolution + "}";
                 }
                 catch (Exception ex)
                 {
@@ -454,7 +471,7 @@ namespace StudioHTTPAPI
                 done.Set();
             }));
 
-            done.WaitOne(120000);
+            done.WaitOne(180000);
 
             if (resultGlb != null)
             {
@@ -463,6 +480,156 @@ namespace StudioHTTPAPI
             }
 
             return resultJson ?? "{\"error\":\"timeout\"}";
+        }
+
+        private string DebugChaFile(string query)
+        {
+            var indexStr = GetParam(query, "index") ?? "0";
+            int index; if (!int.TryParse(indexStr, out index)) index = 0;
+            try
+            {
+                var cc = GetChaControlByIndex(index);
+                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character at index " + index + "\"}";
+
+                var sb = new StringBuilder();
+                sb.Append("{");
+
+                var chaFileProp = cc.GetType().GetProperty("chaFile", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(chaFileProp, null))
+                {
+                    var chaFile = chaFileProp.GetValue(cc, null);
+                    if (!ReferenceEquals(chaFile, null))
+                    {
+                        sb.Append("\"chaFile\":\"" + Escape(chaFile.GetType().FullName) + "\"");
+
+                        var customField = chaFile.GetType().GetField("custom", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                        if (!ReferenceEquals(customField, null))
+                        {
+                            var custom = customField.GetValue(chaFile);
+                            if (!ReferenceEquals(custom, null))
+                            {
+                                sb.Append(",\"custom\":\"" + Escape(custom.GetType().FullName) + "\"");
+
+                                var bodyField = custom.GetType().GetField("body", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (!ReferenceEquals(bodyField, null))
+                                {
+                                    var body = bodyField.GetValue(custom);
+                                    if (!ReferenceEquals(body, null))
+                                    {
+                                        sb.Append(",\"body\":\"" + Escape(body.GetType().FullName) + "\"");
+                                        DumpObjectFields(body, "", 0);
+
+                                        foreach (var f in body.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                                        {
+                                            try
+                                            {
+                                                var val = f.GetValue(body);
+                                                if (ReferenceEquals(val, null)) continue;
+                                                if (val is string s) sb.Append(",\"body." + f.Name + "\":\"" + Escape(s) + "\"");
+                                                else if (val is int || val is float || val is bool) sb.Append(",\"body." + f.Name + "\":" + val);
+                                            }
+                                            catch { }
+                                        }
+
+                                        var skinField = body.GetType().GetField("skin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                        if (!ReferenceEquals(skinField, null))
+                                        {
+                                            var skin = skinField.GetValue(body);
+                                            if (!ReferenceEquals(skin, null))
+                                            {
+                                                sb.Append(",\"skin\":\"" + Escape(skin.GetType().FullName) + "\"");
+                                                foreach (var f in skin.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                                                {
+                                                    try
+                                                    {
+                                                        var val = f.GetValue(skin);
+                                                        if (ReferenceEquals(val, null)) continue;
+                                                        if (val is string s2) sb.Append(",\"skin." + f.Name + "\":\"" + Escape(s2) + "\"");
+                                                        else if (val is int || val is float || val is bool) sb.Append(",\"skin." + f.Name + "\":" + val);
+                                                        else if (val is Array arr2) sb.Append(",\"skin." + f.Name + "\":\"Array[" + arr2.Length + "]\"");
+                                                    }
+                                                    catch { }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                var faceField = custom.GetType().GetField("face", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (!ReferenceEquals(faceField, null))
+                                {
+                                    var face = faceField.GetValue(custom);
+                                    if (!ReferenceEquals(face, null))
+                                    {
+                                        sb.Append(",\"face\":\"" + Escape(face.GetType().FullName) + "\"");
+                                        foreach (var f in face.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                                        {
+                                            try
+                                            {
+                                                var val = f.GetValue(face);
+                                                if (ReferenceEquals(val, null)) continue;
+                                                if (val is string s3) sb.Append(",\"face." + f.Name + "\":\"" + Escape(s3) + "\"");
+                                                else if (val is int || val is float || val is bool) sb.Append(",\"face." + f.Name + "\":" + val);
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                }
+
+                                var hairField = custom.GetType().GetField("hair", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (!ReferenceEquals(hairField, null))
+                                {
+                                    var hair = hairField.GetValue(custom);
+                                    if (!ReferenceEquals(hair, null))
+                                    {
+                                        sb.Append(",\"hair\":\"" + Escape(hair.GetType().FullName) + "\"");
+                                        foreach (var f in hair.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                                        {
+                                            try
+                                            {
+                                                var val = f.GetValue(hair);
+                                                if (ReferenceEquals(val, null)) continue;
+                                                if (val is string s4) sb.Append(",\"hair." + f.Name + "\":\"" + Escape(s4) + "\"");
+                                                else if (val is int || val is float || val is bool) sb.Append(",\"hair." + f.Name + "\":" + val);
+                                            }
+                                            catch { }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                var texDir = Path.Combine(Path.Combine(Path.Combine(Application.dataPath, ".."), "UserData"), "texture");
+                sb.Append(",\"textureDirs\":[");
+                if (Directory.Exists(texDir))
+                {
+                    var dirs = Directory.GetDirectories(texDir);
+                    for (int i = 0; i < dirs.Length; i++)
+                    {
+                        if (i > 0) sb.Append(",");
+                        var dirName = Path.GetFileName(dirs[i]);
+                        var files = Directory.GetFiles(dirs[i], "*.png");
+                        sb.Append("{\"name\":\"" + Escape(dirName) + "\",\"count\":" + files.Length);
+                        if (files.Length > 0 && files.Length <= 5)
+                        {
+                            sb.Append(",\"files\":[");
+                            for (int fi = 0; fi < files.Length; fi++)
+                            {
+                                if (fi > 0) sb.Append(",");
+                                sb.Append("\"" + Escape(Path.GetFileName(files[fi])) + "\"");
+                            }
+                            sb.Append("]");
+                        }
+                        sb.Append("}");
+                    }
+                }
+                sb.Append("]}");
+
+                return sb.ToString();
+            }
+            catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
         }
 
         private ChaControl GetChaControlByIndex(int index)
@@ -513,6 +680,188 @@ namespace StudioHTTPAPI
             }
             for (int i = 0; i < t.childCount; i++)
                 FindBodyRendererRecursive(t.GetChild(i), ref best, ref bestVerts);
+        }
+
+        private System.Collections.Generic.List<SkinnedMeshRenderer> FindAllRenderers(ChaControl cc)
+        {
+            var renderers = new System.Collections.Generic.List<SkinnedMeshRenderer>();
+            FindAllRenderersRecursive(cc.transform, renderers);
+            renderers.Sort((a, b) => b.sharedMesh.vertexCount.CompareTo(a.sharedMesh.vertexCount));
+            return renderers;
+        }
+
+        private void FindAllRenderersRecursive(Transform t, System.Collections.Generic.List<SkinnedMeshRenderer> list)
+        {
+            var smr = t.GetComponent<SkinnedMeshRenderer>();
+            if (!ReferenceEquals(smr, null) && !ReferenceEquals(smr.sharedMesh, null) && smr.sharedMesh.vertexCount > 100)
+                list.Add(smr);
+            for (int i = 0; i < t.childCount; i++)
+                FindAllRenderersRecursive(t.GetChild(i), list);
+        }
+
+        private Texture2D BakeTextureViaUVRender(SkinnedMeshRenderer renderer, int resolution)
+        {
+            try
+            {
+                Mesh bakedMesh = new Mesh();
+                renderer.BakeMesh(bakedMesh);
+
+                var srcUV = bakedMesh.uv;
+                if (srcUV == null || srcUV.Length == 0) { Log("TEX: no UVs for UV bake"); return null; }
+
+                int vertCount = srcUV.Length;
+                var uvVerts = new Vector3[vertCount];
+                for (int i = 0; i < vertCount; i++)
+                    uvVerts[i] = new Vector3(srcUV[i].x, srcUV[i].y, 0);
+
+                var uvMesh = new Mesh();
+                uvMesh.vertices = uvVerts;
+                uvMesh.triangles = bakedMesh.triangles;
+                uvMesh.uv = srcUV;
+                var norms = bakedMesh.normals;
+                if (norms != null && norms.Length == vertCount)
+                {
+                    var camNorms = new Vector3[vertCount];
+                    for (int i = 0; i < vertCount; i++) camNorms[i] = new Vector3(0, 0, -1);
+                    uvMesh.normals = camNorms;
+                }
+                uvMesh.RecalculateBounds();
+
+                var rt = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                var camObj = new GameObject("_UVBakeCam_" + renderer.name);
+                var cam = camObj.AddComponent<Camera>();
+                cam.orthographic = true;
+                cam.orthographicSize = 0.55f;
+                cam.transform.position = new Vector3(0.5f, 0.5f, -10);
+                cam.transform.LookAt(new Vector3(0.5f, 0.5f, 0));
+                cam.backgroundColor = new Color(0, 0, 0, 0);
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.targetTexture = rt;
+                cam.cullingMask = -1;
+                cam.depth = -999;
+
+                var meshObj = new GameObject("_UVBakeObj_" + renderer.name);
+                var mf = meshObj.AddComponent<MeshFilter>();
+                mf.mesh = uvMesh;
+                var mr = meshObj.AddComponent<MeshRenderer>();
+                mr.sharedMaterial = renderer.sharedMaterials.Length > 0 ? renderer.sharedMaterials[0] : null;
+
+                cam.Render();
+
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var tex = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, resolution, resolution), 0, 0);
+                tex.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+
+                UnityEngine.Object.DestroyImmediate(camObj);
+                UnityEngine.Object.DestroyImmediate(meshObj);
+                UnityEngine.Object.DestroyImmediate(uvMesh);
+
+                Log("TEX: UV bake done " + tex.width + "x" + tex.height + " for " + renderer.name);
+                return tex;
+            }
+            catch (Exception ex) { Log("TEX: UV bake failed: " + ex.Message); return null; }
+        }
+
+        private Texture2D ExtractCompositedTexture(Material material, int resolution)
+        {
+            try
+            {
+                var mainTex = material.mainTexture;
+                if (ReferenceEquals(mainTex, null)) { Log("TEX: composite mainTex null"); return null; }
+
+                var tempMat = new Material(material);
+                var rt = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(mainTex, rt, tempMat);
+
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt;
+                var tex = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, resolution, resolution), 0, 0);
+                tex.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt);
+                UnityEngine.Object.DestroyImmediate(tempMat);
+
+                Log("TEX: composited " + tex.width + "x" + tex.height);
+                return tex;
+            }
+            catch (Exception ex) { Log("TEX: composite failed: " + ex.Message); return null; }
+        }
+
+        private byte[] ExtractTextureForRenderer(SkinnedMeshRenderer renderer, int resolution)
+        {
+            try
+            {
+                var mats = renderer.sharedMaterials;
+                if (mats.Length == 0) return null;
+
+                for (int mi = 0; mi < mats.Length; mi++)
+                {
+                    var mat = mats[mi];
+                    if (ReferenceEquals(mat, null)) continue;
+
+                    Log("TEX: renderer=" + renderer.name + " mat[" + mi + "] shader=" + mat.shader.name);
+
+                    if (!ReferenceEquals(mat.mainTexture, null))
+                    {
+                        if (mat.mainTexture is RenderTexture rt)
+                        {
+                            int w = Math.Min(rt.width, resolution);
+                            int h = Math.Min(rt.height, resolution);
+                            var dst = RenderTexture.GetTemporary(w, h, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                            Graphics.Blit(rt, dst);
+                            var prev = RenderTexture.active;
+                            RenderTexture.active = dst;
+                            var t2d = new Texture2D(w, h, TextureFormat.RGBA32, false);
+                            t2d.ReadPixels(new Rect(0, 0, w, h), 0, 0);
+                            t2d.Apply();
+                            RenderTexture.active = prev;
+                            RenderTexture.ReleaseTemporary(dst);
+                            var png = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
+                            UnityEngine.Object.Destroy(t2d);
+                            Log("TEX: RenderTexture extracted " + w + "x" + h);
+                            return png;
+                        }
+
+                        var composited = ExtractCompositedTexture(mat, resolution);
+                        if (!ReferenceEquals(composited, null))
+                        {
+                            var png = GlbBuilder.EncodePngRaw(composited.GetPixels32(), composited.width, composited.height);
+                            UnityEngine.Object.Destroy(composited);
+                            return png;
+                        }
+                    }
+
+                    string[] propNames = { "_ColorTex", "_MainTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap", "_DetailTex", "_DetailMask", "_ShadowTex", "_ShadowColorMultiplyTex", "_ShadowColorTexture", "_SubTex", "_TexID", "_MainTex2", "_Diffuse", "_Albedo", "_SkinTex", "_BodyTex", "_BodyTex2", "_FaceTex", "_HairTex", "_NormalTex", "_BumpTex", "_SpecularTex", "_RampTex", "_GradientTex", "_AccessTex", "_ColorMask", "_SubMask", "_DetailMask2", "_EyeTex", "_EyeHiTex", "_EyeHighLightTex" };
+                    for (int pi = 0; pi < propNames.Length; pi++)
+                    {
+                        var tex = mat.GetTexture(propNames[pi]);
+                        if (ReferenceEquals(tex, null)) continue;
+
+                        var rt2 = RenderTexture.GetTemporary(Math.Min(tex.width, resolution), Math.Min(tex.height, resolution), 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                        Graphics.Blit(tex, rt2);
+                        var prev2 = RenderTexture.active;
+                        RenderTexture.active = rt2;
+                        var t2 = new Texture2D(rt2.width, rt2.height, TextureFormat.RGBA32, false);
+                        t2.ReadPixels(new Rect(0, 0, rt2.width, rt2.height), 0, 0);
+                        t2.Apply();
+                        RenderTexture.active = prev2;
+                        RenderTexture.ReleaseTemporary(rt2);
+                        var png2 = GlbBuilder.EncodePngRaw(t2.GetPixels32(), t2.width, t2.height);
+                        UnityEngine.Object.Destroy(t2);
+                        Log("TEX: property " + propNames[pi] + " extracted " + t2.width + "x" + t2.height);
+                        return png2;
+                    }
+                }
+
+                Log("TEX: no texture found for " + renderer.name);
+                return null;
+            }
+            catch (Exception ex) { Log("TEX: extract error: " + ex.Message); return null; }
         }
 
         private Texture2D ExtractTexture(SkinnedMeshRenderer renderer)
@@ -566,6 +915,31 @@ namespace StudioHTTPAPI
                 return readable;
             }
             catch (Exception ex) { Log("TEX: error " + ex.Message); return null; }
+        }
+
+        private void DumpObjectFields(object obj, string prefix, int depth)
+        {
+            if (ReferenceEquals(obj, null) || depth > 4) return;
+            try
+            {
+                var t = obj.GetType();
+                Log(prefix + "type=" + t.FullName);
+                foreach (var f in t.GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                {
+                    try
+                    {
+                        var val = f.GetValue(obj);
+                        if (ReferenceEquals(val, null)) { Log(prefix + f.Name + " = null"); continue; }
+                        if (val is string s) { Log(prefix + f.Name + " = \"" + s + "\""); }
+                        else if (val is int || val is float || val is bool || val is short || val is byte) { Log(prefix + f.Name + " = " + val); }
+                        else if (val is Array arr) { Log(prefix + f.Name + " = Array[" + arr.Length + "]"); }
+                        else if (val is UnityEngine.Color col) { Log(prefix + f.Name + " = Color(" + col.r + "," + col.g + "," + col.b + "," + col.a + ")"); }
+                        else { Log(prefix + f.Name + " = <" + val.GetType().Name + ">"); if (depth < 3) DumpObjectFields(val, prefix + f.Name + ".", depth + 1); }
+                    }
+                    catch { Log(prefix + f.Name + " = <error>"); }
+                }
+            }
+            catch { }
         }
 
         private Texture2D ExtractTextureFromChaControl(ChaControl cc)
@@ -633,7 +1007,6 @@ namespace StudioHTTPAPI
                 Log("TEX: no texture found");
 
                 return null;
-                return null;
             }
             catch (Exception ex) { Log("TEX: error " + ex.GetType().Name + " " + ex.Message); return null; }
         }
@@ -671,31 +1044,166 @@ namespace StudioHTTPAPI
             return null;
         }
 
-        private Texture2D FindBodyTexture(ChaControl cc)
+        private byte[] ExtractTextureFromChaFile(ChaControl cc, int rendererIndex)
         {
             try
             {
                 var ccType = cc.GetType();
                 var chaFileProp = ccType.GetProperty("chaFile", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (ReferenceEquals(chaFileProp, null)) { Log("TEX: chaFile not found"); return null; }
+                if (ReferenceEquals(chaFileProp, null)) { Log("CHAFILE: chaFile prop not found"); return null; }
                 var chaFile = chaFileProp.GetValue(cc, null);
-                if (ReferenceEquals(chaFile, null)) { Log("TEX: chaFile null"); return null; }
-                Log("TEX: chaFile type=" + chaFile.GetType().FullName);
+                if (ReferenceEquals(chaFile, null)) { Log("CHAFILE: chaFile null"); return null; }
 
                 var customField = chaFile.GetType().GetField("custom", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (ReferenceEquals(customField, null)) { Log("TEX: custom field not found"); return null; }
+                if (ReferenceEquals(customField, null)) { Log("CHAFILE: custom not found"); return null; }
                 var custom = customField.GetValue(chaFile);
-                if (ReferenceEquals(custom, null)) { Log("TEX: custom null"); return null; }
-                Log("TEX: custom type=" + custom.GetType().FullName);
+                if (ReferenceEquals(custom, null)) { Log("CHAFILE: custom null"); return null; }
 
                 var bodyField = custom.GetType().GetField("body", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
-                if (ReferenceEquals(bodyField, null)) { Log("TEX: body field not found"); return null; }
+                if (ReferenceEquals(bodyField, null)) { Log("CHAFILE: body not found"); return null; }
                 var body = bodyField.GetValue(custom);
-                if (ReferenceEquals(body, null)) { Log("TEX: body null"); return null; }
-                Log("TEX: body type=" + body.GetType().FullName);
+                if (ReferenceEquals(body, null)) { Log("CHAFILE: body null"); return null; }
+
+                Log("CHAFILE: body type=" + body.GetType().FullName);
+
+                var skinField = body.GetType().GetField("skin", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(skinField, null)) { Log("CHAFILE: skin not found"); return null; }
+                var skin = skinField.GetValue(body);
+                if (ReferenceEquals(skin, null)) { Log("CHAFILE: skin null"); return null; }
+
+                Log("CHAFILE: skin type=" + skin.GetType().FullName);
+                DumpObjectFields(skin, "CHAFILE: skin.", 0);
+                DumpObjectFields(body, "CHAFILE: body.", 0);
+
+                var texFileNames = new System.Collections.Generic.List<string>();
+
+                var mainTexField = skin.GetType().GetField("mainTex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(mainTexField, null))
+                {
+                    var val = mainTexField.GetValue(skin) as string;
+                    if (!string.IsNullOrEmpty(val)) { Log("CHAFILE: skin.mainTex=" + val); texFileNames.Add(val); }
+                }
+
+                var mainTexProp = skin.GetType().GetProperty("mainTex", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(mainTexProp, null))
+                {
+                    var val = mainTexProp.GetValue(skin, null) as string;
+                    if (!string.IsNullOrEmpty(val) && !texFileNames.Contains(val)) { Log("CHAFILE: skin.mainTex(prop)=" + val); texFileNames.Add(val); }
+                }
+
+                var colorInfoField = skin.GetType().GetField("colorInfo", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(colorInfoField, null))
+                {
+                    var arr = colorInfoField.GetValue(skin) as Array;
+                    if (!ReferenceEquals(arr, null) && arr.Length > 0)
+                    {
+                        Log("CHAFILE: colorInfo count=" + arr.Length);
+                        for (int ci = 0; ci < Math.Min(arr.Length, 4); ci++)
+                        {
+                            var ciObj = arr.GetValue(ci);
+                            if (ReferenceEquals(ciObj, null)) continue;
+
+                            string[] propNames = { "mainTex", "subTex", "texMain", "texSub", "diffuseTex" };
+                            foreach (var pn in propNames)
+                            {
+                                var f = ciObj.GetType().GetField(pn, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (!ReferenceEquals(f, null))
+                                {
+                                    var v = f.GetValue(ciObj) as string;
+                                    if (!string.IsNullOrEmpty(v) && !texFileNames.Contains(v)) { Log("CHAFILE: colorInfo[" + ci + "]." + pn + "=" + v); texFileNames.Add(v); }
+                                }
+                                var p = ciObj.GetType().GetProperty(pn, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                                if (!ReferenceEquals(p, null))
+                                {
+                                    var v = p.GetValue(ciObj, null) as string;
+                                    if (!string.IsNullOrEmpty(v) && !texFileNames.Contains(v)) { Log("CHAFILE: colorInfo[" + ci + "]." + pn + "(p)=" + v); texFileNames.Add(v); }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                string[] skinFieldNames = { "mainTexName", "texName", "textureName", "baseTex" };
+                foreach (var fn in skinFieldNames)
+                {
+                    var f = skin.GetType().GetField(fn, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                    if (!ReferenceEquals(f, null))
+                    {
+                        var v = f.GetValue(skin) as string;
+                        if (!string.IsNullOrEmpty(v) && !texFileNames.Contains(v)) { Log("CHAFILE: skin." + fn + "=" + v); texFileNames.Add(v); }
+                    }
+                }
+
+                var skinIdField = skin.GetType().GetField("id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                int skinId = -1;
+                if (!ReferenceEquals(skinIdField, null)) skinId = (int)skinIdField.GetValue(skin);
+
+                var bodyIdField = body.GetType().GetField("id", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                int bodyId = -1;
+                if (!ReferenceEquals(bodyIdField, null)) bodyId = (int)bodyIdField.GetValue(body);
+
+                Log("CHAFILE: skinId=" + skinId + " bodyId=" + bodyId);
+
+                string texDir = Path.Combine(Path.Combine(Path.Combine(Application.dataPath, ".."), "UserData"), "texture");
+                string bodyTexDir = Path.Combine(texDir, "body");
+
+                var searchPaths = new System.Collections.Generic.List<string>();
+                foreach (var fn in texFileNames)
+                {
+                    searchPaths.Add(Path.Combine(bodyTexDir, fn));
+                    searchPaths.Add(Path.Combine(texDir, fn));
+                    searchPaths.Add(fn);
+                }
+
+                if (skinId >= 0)
+                {
+                    searchPaths.Add(Path.Combine(bodyTexDir, skinId + ".png"));
+                    searchPaths.Add(Path.Combine(bodyTexDir, skinId + "_00.png"));
+                    searchPaths.Add(Path.Combine(bodyTexDir, bodyId + "_" + skinId + "_00.png"));
+                    searchPaths.Add(Path.Combine(bodyTexDir, "body_" + skinId.ToString("D2") + ".png"));
+                }
+
+                if (Directory.Exists(bodyTexDir))
+                {
+                    var allFiles = Directory.GetFiles(bodyTexDir, "*.png");
+                    Log("CHAFILE: body tex dir has " + allFiles.Length + " files");
+                    foreach (var f in allFiles)
+                    {
+                        Log("CHAFILE:   file: " + Path.GetFileName(f));
+                    }
+                }
+
+                foreach (var sp in searchPaths)
+                {
+                    if (File.Exists(sp))
+                    {
+                        var bytes = File.ReadAllBytes(sp);
+                        Log("CHAFILE: loaded " + sp + " (" + bytes.Length + " bytes)");
+                        return bytes;
+                    }
+                }
+
+                if (Directory.Exists(bodyTexDir) && texFileNames.Count == 0)
+                {
+                    var pngs = Directory.GetFiles(bodyTexDir, "*.png");
+                    if (pngs.Length > 0 && rendererIndex < pngs.Length)
+                    {
+                        var bytes = File.ReadAllBytes(pngs[rendererIndex]);
+                        Log("CHAFILE: fallback loaded " + pngs[rendererIndex] + " (" + bytes.Length + " bytes)");
+                        return bytes;
+                    }
+                    else if (pngs.Length > 0)
+                    {
+                        var bytes = File.ReadAllBytes(pngs[0]);
+                        Log("CHAFILE: fallback loaded " + pngs[0] + " (" + bytes.Length + " bytes)");
+                        return bytes;
+                    }
+                }
+
+                Log("CHAFILE: no texture file found");
                 return null;
             }
-            catch (Exception ex) { Log("TEX: error " + ex.GetType().Name + " " + ex.Message); return null; }
+            catch (Exception ex) { Log("CHAFILE: error " + ex.GetType().Name + " " + ex.Message); return null; }
         }
 
         private object GetStudioInstance()
@@ -777,6 +1285,13 @@ namespace StudioHTTPAPI
         private void OnDestroy() { isRunning = false; try { tcpListener.Stop(); } catch { } Log("Server stopped"); }
     }
 
+    public class MeshEntry
+    {
+        public Mesh mesh;
+        public byte[] pngData;
+        public string name;
+    }
+
     public static class GlbBuilder
     {
         public static byte[] Build(Mesh mesh, byte[] pngData, string name)
@@ -854,9 +1369,9 @@ namespace StudioHTTPAPI
             }
             sb.Append("]");
             sb.Append(",\"buffers\":[{\"byteLength\":"); sb.Append(binTotal); sb.Append("}]");
-            sb.Append(",\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":1.0}");
+            sb.Append(",\"materials\":[{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":1.0");
             if (texBV >= 0) sb.Append(",\"baseColorTexture\":{\"index\":0}");
-            sb.Append("}]");
+            sb.Append("}}]");
             if (texBV >= 0)
             {
                 sb.Append(",\"textures\":[{\"source\":0}]");
@@ -926,6 +1441,213 @@ namespace StudioHTTPAPI
             {
                 Array.Copy(texPng, 0, result, pos, texPng.Length);
             }
+
+            return result;
+        }
+
+        public static byte[] BuildMulti(System.Collections.Generic.List<MeshEntry> entries)
+        {
+            int N = entries.Count;
+            bool[] u32 = new bool[N];
+            for (int i = 0; i < N; i++) u32[i] = entries[i].mesh.vertices.Length > 65535;
+
+            var binMs = new MemoryStream();
+            int[] actualPosOff = new int[N], actualNormOff = new int[N], actualUvOff = new int[N], actualIdxOff = new int[N];
+            int[] actualPosLen = new int[N], actualNormLen = new int[N], actualUvLen = new int[N], actualIdxLen = new int[N];
+
+            for (int i = 0; i < N; i++)
+            {
+                var mesh = entries[i].mesh;
+                var verts = mesh.vertices;
+                var norms = mesh.normals;
+                var uv = mesh.uv;
+                var tri = mesh.triangles;
+
+                actualPosOff[i] = (int)binMs.Position;
+                actualPosLen[i] = verts.Length * 12;
+                var buf = new byte[12];
+                for (int j = 0; j < verts.Length; j++)
+                {
+                    BitConverter.GetBytes(verts[j].x).CopyTo(buf, 0);
+                    BitConverter.GetBytes(verts[j].y).CopyTo(buf, 4);
+                    BitConverter.GetBytes(-verts[j].z).CopyTo(buf, 8);
+                    binMs.Write(buf, 0, 12);
+                }
+
+                actualNormOff[i] = (int)binMs.Position;
+                actualNormLen[i] = (norms != null ? norms.Length : 0) * 12;
+                if (norms != null)
+                {
+                    for (int j = 0; j < norms.Length; j++)
+                    {
+                        BitConverter.GetBytes(norms[j].x).CopyTo(buf, 0);
+                        BitConverter.GetBytes(norms[j].y).CopyTo(buf, 4);
+                        BitConverter.GetBytes(-norms[j].z).CopyTo(buf, 8);
+                        binMs.Write(buf, 0, 12);
+                    }
+                }
+
+                actualUvOff[i] = (int)binMs.Position;
+                actualUvLen[i] = (uv != null ? uv.Length : 0) * 8;
+                if (uv != null)
+                {
+                    var uvBuf = new byte[8];
+                    for (int j = 0; j < uv.Length; j++)
+                    {
+                        BitConverter.GetBytes(uv[j].x).CopyTo(uvBuf, 0);
+                        BitConverter.GetBytes(uv[j].y).CopyTo(uvBuf, 4);
+                        binMs.Write(uvBuf, 0, 8);
+                    }
+                }
+
+                actualIdxOff[i] = (int)binMs.Position;
+                actualIdxLen[i] = tri.Length * (u32[i] ? 4 : 2);
+                if (u32[i])
+                {
+                    var iBuf = new byte[4];
+                    for (int j = 0; j < tri.Length; j += 3)
+                    {
+                        BitConverter.GetBytes((uint)tri[j]).CopyTo(iBuf, 0); binMs.Write(iBuf, 0, 4);
+                        BitConverter.GetBytes((uint)tri[j + 2]).CopyTo(iBuf, 0); binMs.Write(iBuf, 0, 4);
+                        BitConverter.GetBytes((uint)tri[j + 1]).CopyTo(iBuf, 0); binMs.Write(iBuf, 0, 4);
+                    }
+                }
+                else
+                {
+                    var sBuf = new byte[2];
+                    for (int j = 0; j < tri.Length; j += 3)
+                    {
+                        BitConverter.GetBytes((ushort)tri[j]).CopyTo(sBuf, 0); binMs.Write(sBuf, 0, 2);
+                        BitConverter.GetBytes((ushort)tri[j + 2]).CopyTo(sBuf, 0); binMs.Write(sBuf, 0, 2);
+                        BitConverter.GetBytes((ushort)tri[j + 1]).CopyTo(sBuf, 0); binMs.Write(sBuf, 0, 2);
+                    }
+                }
+            }
+
+            int[] texOff = new int[N], texLen = new int[N], texGlbIdx = new int[N];
+            int texCount = 0;
+            for (int i = 0; i < N; i++)
+            {
+                if (entries[i].pngData != null && entries[i].pngData.Length > 0)
+                {
+                    texOff[i] = (int)binMs.Position;
+                    texLen[i] = entries[i].pngData.Length;
+                    binMs.Write(entries[i].pngData, 0, entries[i].pngData.Length);
+                    texGlbIdx[i] = texCount++;
+                }
+                else { texGlbIdx[i] = -1; texLen[i] = 0; }
+            }
+
+            int binTotal = (int)binMs.Position;
+            byte[] binData = binMs.ToArray();
+            binMs.Dispose();
+
+            var sb = new StringBuilder();
+            sb.Append("{\"asset\":{\"version\":\"2.0\",\"generator\":\"StudioHTTPAPI\"}");
+            sb.Append(",\"scene\":0,\"scenes\":[{\"nodes\":[");
+            for (int i = 0; i < N; i++) { if (i > 0) sb.Append(","); sb.Append(i); }
+            sb.Append("]}]");
+            sb.Append(",\"nodes\":[");
+            for (int i = 0; i < N; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"mesh\":" + i + ",\"name\":\"" + EscapeJson(entries[i].name) + "\"}");
+            }
+            sb.Append("]");
+            sb.Append(",\"meshes\":[");
+            for (int i = 0; i < N; i++)
+            {
+                if (i > 0) sb.Append(",");
+                int baseAcc = i * 4;
+                sb.Append("{\"primitives\":[{\"attributes\":{\"POSITION\":" + baseAcc + ",\"NORMAL\":" + (baseAcc + 1) + ",\"TEXCOORD_0\":" + (baseAcc + 2) + "},\"indices\":" + (baseAcc + 3) + ",\"material\":" + i + "}]}");
+            }
+            sb.Append("]");
+            sb.Append(",\"accessors\":[");
+            for (int i = 0; i < N; i++)
+            {
+                if (i > 0) sb.Append(",");
+                int bi = i * 4;
+                var mesh = entries[i].mesh;
+                var verts = mesh.vertices;
+                float px = float.MaxValue, py = float.MaxValue, pz = float.MaxValue;
+                float qx = float.MinValue, qy = float.MinValue, qz = float.MinValue;
+                for (int j = 0; j < verts.Length; j++)
+                {
+                    float x = verts[j].x, y = verts[j].y, z = -verts[j].z;
+                    if (x < px) px = x; if (x > qx) qx = x;
+                    if (y < py) py = y; if (y > qy) qy = y;
+                    if (z < pz) pz = z; if (z > qz) qz = z;
+                }
+                sb.Append("{\"bufferView\":" + bi + ",\"componentType\":5126,\"count\":" + verts.Length + ",\"type\":\"VEC3\",\"min\":[" + F(px) + "," + F(py) + "," + F(pz) + "],\"max\":[" + F(qx) + "," + F(qy) + "," + F(qz) + "]}");
+                sb.Append(",{\"bufferView\":" + (bi + 1) + ",\"componentType\":5126,\"count\":" + mesh.normals.Length + ",\"type\":\"VEC3\"}");
+                var uv = mesh.uv;
+                sb.Append(",{\"bufferView\":").Append(bi + 2).Append(",\"componentType\":5126,\"count\":").Append(uv != null ? uv.Length : 0).Append(",\"type\":\"VEC2\"}");
+                sb.Append(",{\"bufferView\":" + (bi + 3) + ",\"componentType\":" + (u32[i] ? 5125 : 5123) + ",\"count\":" + mesh.triangles.Length + ",\"type\":\"SCALAR\"}");
+            }
+            sb.Append("]");
+            sb.Append(",\"bufferViews\":[");
+            bool first = true;
+            for (int i = 0; i < N; i++)
+            {
+                int bi = i * 4;
+                if (!first) sb.Append(","); first = false;
+                sb.Append("{\"buffer\":0,\"byteOffset\":" + actualPosOff[i] + ",\"byteLength\":" + actualPosLen[i] + ",\"target\":34962}");
+                sb.Append(",{\"buffer\":0,\"byteOffset\":" + actualNormOff[i] + ",\"byteLength\":" + actualNormLen[i] + ",\"target\":34962}");
+                sb.Append(",{\"buffer\":0,\"byteOffset\":" + actualUvOff[i] + ",\"byteLength\":" + actualUvLen[i] + ",\"target\":34962}");
+                sb.Append(",{\"buffer\":0,\"byteOffset\":" + actualIdxOff[i] + ",\"byteLength\":" + actualIdxLen[i] + ",\"target\":34963}");
+            }
+            for (int i = 0; i < N; i++)
+            {
+                if (texGlbIdx[i] < 0) continue;
+                sb.Append(",{\"buffer\":0,\"byteOffset\":" + texOff[i] + ",\"byteLength\":" + texLen[i] + "}");
+            }
+            sb.Append("]");
+            sb.Append(",\"buffers\":[{\"byteLength\":" + binTotal + "}]");
+            sb.Append(",\"materials\":[");
+            for (int i = 0; i < N; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.Append("{\"pbrMetallicRoughness\":{\"metallicFactor\":0.0,\"roughnessFactor\":1.0");
+                if (texGlbIdx[i] >= 0) sb.Append(",\"baseColorTexture\":{\"index\":" + texGlbIdx[i] + "}");
+                sb.Append("}}");
+            }
+            sb.Append("]");
+            if (texCount > 0)
+            {
+                sb.Append(",\"textures\":[");
+                for (int j = 0; j < texCount; j++) { if (j > 0) sb.Append(","); sb.Append("{\"source\":" + j + "}"); }
+                sb.Append("],\"images\":[");
+                int imgIdx = 0;
+                for (int i = 0; i < N; i++)
+                {
+                    if (texGlbIdx[i] < 0) continue;
+                    if (imgIdx > 0) sb.Append(",");
+                    int bvIdx = 4 * N + imgIdx;
+                    sb.Append("{\"mimeType\":\"image/png\",\"bufferView\":" + bvIdx + "}");
+                    imgIdx++;
+                }
+                sb.Append("],\"samplers\":[{\"magFilter\":9729,\"minFilter\":9987}]");
+            }
+            sb.Append("}");
+
+            byte[] jsonBytes = Encoding.UTF8.GetBytes(sb.ToString());
+            int jsonPadded = Align4(jsonBytes.Length);
+            int binPadded = Align4(binTotal);
+            int totalLen = 12 + 8 + jsonPadded + 8 + binPadded;
+            var result = new byte[totalLen];
+            int pos = 0;
+
+            WriteUint(result, ref pos, 0x46546C67);
+            WriteUint(result, ref pos, 2);
+            WriteUint(result, ref pos, (uint)totalLen);
+            WriteUint(result, ref pos, (uint)jsonPadded);
+            WriteUint(result, ref pos, 0x4E4F534A);
+            Array.Copy(jsonBytes, 0, result, pos, jsonBytes.Length);
+            for (int i = jsonBytes.Length; i < jsonPadded; i++) result[pos + i] = 0x20;
+            pos += jsonPadded;
+            WriteUint(result, ref pos, (uint)binPadded);
+            WriteUint(result, ref pos, 0x004E4942);
+            Array.Copy(binData, 0, result, pos, binTotal);
 
             return result;
         }
