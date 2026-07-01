@@ -367,6 +367,8 @@ namespace StudioHTTPAPI
             if (resolution > 4096) resolution = 4096;
             var bodyOnlyStr = GetParam(query, "bodyOnly");
             bool bodyOnly = bodyOnlyStr == "true" || bodyOnlyStr == "1";
+            var includeHeadStr = GetParam(query, "includeHead");
+            bool includeHead = includeHeadStr == "true" || includeHeadStr == "1";
             var dir = UserDataPath("export");
             Directory.CreateDirectory(dir);
             var fullPath = Path.Combine(dir, filename);
@@ -393,12 +395,16 @@ namespace StudioHTTPAPI
                         {
                             var s = r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null)
                                 ? r.sharedMaterials[0].shader.name : "";
-                            if (s != "Shader Forge/main_skin") return true;
+                            if (s != "Shader Forge/main_skin" && s != "Shader Forge/main_face") return true;
                             var n = r.name.ToLower();
-                            if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang") || n.Contains("dankon") || n.Contains("dan_f")) return true;
+                            if (n.Contains("dankon") || n.Contains("dan_f")) return true;
+                            if (!includeHead)
+                            {
+                                if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang")) return true;
+                            }
                             return false;
                         });
-                        Log("EXPORT: bodyOnly filtered to " + allRenderers.Count + " renderers");
+                        Log("EXPORT: bodyOnly" + (includeHead ? "+head" : "") + " filtered to " + allRenderers.Count + " renderers");
                     }
 
                     if (allRenderers.Count == 0) { resultJson = "{\"error\":\"no renderers found\"}"; done.Set(); return; }
@@ -409,11 +415,17 @@ namespace StudioHTTPAPI
                     Color skinColor = GetSkinColorFromChaControl(cc);
                     _exportSkinColor = skinColor;
                     byte[] sharedBodyTex = null;
+                    Vector3 bodyScale = Vector3.one;
 
                     for (int ri = 0; ri < allRenderers.Count; ri++)
                     {
                         var renderer = allRenderers[ri];
-                        Log("EXPORT: [" + ri + "/" + allRenderers.Count + "] " + renderer.name + " verts=" + renderer.sharedMesh.vertexCount);
+                        Log("EXPORT: [" + ri + "/" + allRenderers.Count + "] " + renderer.name + " verts=" + renderer.sharedMesh.vertexCount
+                            + " pos=" + renderer.transform.position
+                            + " scale=" + renderer.transform.lossyScale
+                            + " shader=" + (renderer.sharedMaterials.Length > 0 && !ReferenceEquals(renderer.sharedMaterials[0], null) ? renderer.sharedMaterials[0].shader.name : "none"));
+
+                        if (ri == 0) bodyScale = renderer.transform.lossyScale;
 
                         Mesh bakedMesh = new Mesh();
                         renderer.BakeMesh(bakedMesh);
@@ -455,6 +467,36 @@ namespace StudioHTTPAPI
 
                         if (texPng == null && bodyOnly)
                         {
+                            var n = renderer.name.ToLower();
+                            if (n.Contains("face") || n.StartsWith("cf_o_face"))
+                            {
+                                Log("EXPORT: trying face texture controller for " + renderer.name);
+                                var faceTex = FindRawBodyTexture(cc, "face");
+                                if (!ReferenceEquals(faceTex, null))
+                                {
+                                    var readable = MakeReadable(faceTex);
+                                    if (!ReferenceEquals(readable, null))
+                                    {
+                                        var facePixels = readable.GetPixels32();
+                                        for (int pi = 0; pi < facePixels.Length; pi++)
+                                        {
+                                            facePixels[pi].r = (byte)Math.Min(255, (int)(facePixels[pi].r * skinColor.r));
+                                            facePixels[pi].g = (byte)Math.Min(255, (int)(facePixels[pi].g * skinColor.g));
+                                            facePixels[pi].b = (byte)Math.Min(255, (int)(facePixels[pi].b * skinColor.b));
+                                        }
+                                        readable.SetPixels32(facePixels);
+                                        readable.Apply();
+                                        texPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
+                                        SaveDebugTexture(texPng, "face_raw_texture.png");
+                                        Log("EXPORT: face raw texture " + readable.width + "x" + readable.height + " png=" + texPng.Length);
+                                        UnityEngine.Object.Destroy(readable);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (texPng == null && bodyOnly)
+                        {
                             Log("EXPORT: UV bake via unlit for " + renderer.name);
                             var uvTex = BakeTextureViaUVRender(renderer, resolution);
                             if (!ReferenceEquals(uvTex, null))
@@ -482,7 +524,10 @@ namespace StudioHTTPAPI
                         {
                             mesh = bakedMesh,
                             pngData = texPng,
-                            name = renderer.name
+                            name = renderer.name,
+                            position = renderer.transform.position,
+                            rotation = renderer.transform.rotation,
+                            scale = bodyScale
                         });
 
                         Log("EXPORT: " + renderer.name + " tex=" + (texPng != null ? texPng.Length + "b" : "none"));
@@ -1007,21 +1052,21 @@ namespace StudioHTTPAPI
             catch (Exception ex) { Log("TEX: DumpMaterialTextures error: " + ex.Message); }
         }
 
-        private Texture2D FindRawBodyTexture(ChaControl cc)
+        private Texture2D FindRawBodyTexture(ChaControl cc, string part = "body")
         {
             try
             {
                 var ccType = cc.GetType();
 
-                var prop = ccType.GetProperty("customTexCtrlBody", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                var prop = ccType.GetProperty("customTexCtrl" + part.Substring(0, 1).ToUpper() + part.Substring(1), BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
                 if (ReferenceEquals(prop, null))
                 {
                     foreach (var p in ccType.GetProperties(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
                     {
-                        if (p.Name.ToLower().Contains("customtex") && p.Name.ToLower().Contains("body"))
+                        if (p.Name.ToLower().Contains("customtex") && p.Name.ToLower().Contains(part))
                         {
                             prop = p;
-                            Log("TEX: found customTexCtrlBody via search: " + p.Name);
+                            Log("TEX: found customTexCtrl" + part + " via search: " + p.Name);
                             break;
                         }
                     }
@@ -1816,6 +1861,9 @@ namespace StudioHTTPAPI
         public Mesh mesh;
         public byte[] pngData;
         public string name;
+        public Vector3 position;
+        public Quaternion rotation;
+        public Vector3 scale;
     }
 
     public static class GlbBuilder
@@ -2077,7 +2125,17 @@ namespace StudioHTTPAPI
             for (int i = 0; i < N; i++)
             {
                 if (i > 0) sb.Append(",");
-                sb.Append("{\"mesh\":" + i + ",\"name\":\"" + EscapeJson(entries[i].name) + "\"}");
+                sb.Append("{\"mesh\":" + i + ",\"name\":\"" + EscapeJson(entries[i].name) + "\"");
+                var tPos = entries[i].position;
+                var tRot = entries[i].rotation;
+                var tScl = entries[i].scale;
+                if (tPos != Vector3.zero || tRot != Quaternion.identity || tScl != Vector3.one)
+                {
+                    sb.Append(",\"translation\":[" + F(tPos.x) + "," + F(tPos.y) + "," + F(-tPos.z) + "]");
+                    sb.Append(",\"rotation\":[" + F(tRot.x) + "," + F(tRot.y) + "," + F(-tRot.z) + "," + F(-tRot.w) + "]");
+                    sb.Append(",\"scale\":[" + F(tScl.x) + "," + F(tScl.y) + "," + F(tScl.z) + "]");
+                }
+                sb.Append("}");
             }
             sb.Append("]");
             sb.Append(",\"meshes\":[");
