@@ -46,8 +46,8 @@ echo [5/6] Selecting character (index 0)...
 powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/select-character?index=0' -Method POST -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 timeout /t 2 /nobreak >nul
 
-echo [6/6] Exporting GLB with bodyOnly=true + head...
-powershell -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&resolution=2048' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
+echo [6/6] Exporting GLB with bodyOnly=true + head + hair...
+powershell -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&includeHair=true&resolution=2048' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
 
 echo.
 echo === Done ===

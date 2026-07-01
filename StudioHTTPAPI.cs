@@ -369,6 +369,8 @@ namespace StudioHTTPAPI
             bool bodyOnly = bodyOnlyStr == "true" || bodyOnlyStr == "1";
             var includeHeadStr = GetParam(query, "includeHead");
             bool includeHead = includeHeadStr == "true" || includeHeadStr == "1";
+            var includeHairStr = GetParam(query, "includeHair");
+            bool includeHair = includeHairStr == "true" || includeHairStr == "1";
             var dir = UserDataPath("export");
             Directory.CreateDirectory(dir);
             var fullPath = Path.Combine(dir, filename);
@@ -395,16 +397,18 @@ namespace StudioHTTPAPI
                         {
                             var s = r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null)
                                 ? r.sharedMaterials[0].shader.name : "";
-                            if (s != "Shader Forge/main_skin" && s != "Shader Forge/main_face") return true;
+                            bool isBody = s == "Shader Forge/main_skin";
+                            bool isFace = s == "Shader Forge/main_face";
+                            bool isHair = s == "Shader Forge/main_hair";
+                            if (!isBody && !isFace && !isHair) return true;
                             var n = r.name.ToLower();
                             if (n.Contains("dankon") || n.Contains("dan_f")) return true;
-                            if (!includeHead)
-                            {
-                                if (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("hair") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang")) return true;
-                            }
+                            if (!includeHead && isFace) return true;
+                            if (!includeHair && isHair) return true;
+                            if (!includeHead && !isHair && (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang"))) return true;
                             return false;
                         });
-                        Log("EXPORT: bodyOnly" + (includeHead ? "+head" : "") + " filtered to " + allRenderers.Count + " renderers");
+                        Log("EXPORT: bodyOnly" + (includeHead ? "+head" : "") + (includeHair ? "+hair" : "") + " filtered to " + allRenderers.Count + " renderers");
                     }
 
                     if (allRenderers.Count == 0) { resultJson = "{\"error\":\"no renderers found\"}"; done.Set(); return; }
@@ -489,6 +493,27 @@ namespace StudioHTTPAPI
                                         texPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
                                         SaveDebugTexture(texPng, "face_raw_texture.png");
                                         Log("EXPORT: face raw texture " + readable.width + "x" + readable.height + " png=" + texPng.Length);
+                                        UnityEngine.Object.Destroy(readable);
+                                    }
+                                }
+                            }
+                        }
+
+                        if (texPng == null && bodyOnly)
+                        {
+                            var n = renderer.name.ToLower();
+                            if (n.Contains("hair"))
+                            {
+                                Log("EXPORT: trying hair texture controller for " + renderer.name);
+                                var hairTex = FindRawBodyTexture(cc, "hair");
+                                if (!ReferenceEquals(hairTex, null))
+                                {
+                                    var readable = MakeReadable(hairTex);
+                                    if (!ReferenceEquals(readable, null))
+                                    {
+                                        texPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
+                                        SaveDebugTexture(texPng, "hair_raw_texture.png");
+                                        Log("EXPORT: hair raw texture " + readable.width + "x" + readable.height + " png=" + texPng.Length);
                                         UnityEngine.Object.Destroy(readable);
                                     }
                                 }
