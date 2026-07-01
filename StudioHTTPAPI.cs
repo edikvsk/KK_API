@@ -390,6 +390,12 @@ namespace StudioHTTPAPI
 
                     var allRenderers = FindAllRenderers(cc);
                     Log("EXPORT: found " + allRenderers.Count + " renderers");
+                    for (int di = 0; di < allRenderers.Count; di++)
+                    {
+                        var dr = allRenderers[di];
+                        var ds = dr.sharedMaterials.Length > 0 && !ReferenceEquals(dr.sharedMaterials[0], null) ? dr.sharedMaterials[0].shader.name : "none";
+                        Log("EXPORT: [" + di + "] " + dr.name + " shader=" + ds);
+                    }
 
                     if (bodyOnly)
                     {
@@ -399,7 +405,7 @@ namespace StudioHTTPAPI
                                 ? r.sharedMaterials[0].shader.name : "";
                             bool isBody = s == "Shader Forge/main_skin";
                             bool isFace = s == "Shader Forge/main_face";
-                            bool isHair = s == "Shader Forge/main_hair";
+                            bool isHair = s == "Shader Forge/main_hair" || s == "Shader Forge/main_hair_front";
                             if (!isBody && !isFace && !isHair) return true;
                             var n = r.name.ToLower();
                             if (n.Contains("dankon") || n.Contains("dan_f")) return true;
