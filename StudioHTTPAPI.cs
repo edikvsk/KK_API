@@ -113,6 +113,8 @@ namespace StudioHTTPAPI
                     case "/select-character": body = SelectCharacter(query); break;
                     case "/export-glb": body = ExportGlb(query); break;
                     case "/debug-chafile": body = DebugChaFile(query); break;
+                    case "/debug-renderers": body = DebugRenderers(query); break;
+                    case "/debug-shader": body = DebugShader(query); break;
                     default: body = "{\"error\":\"not found\"}"; break;
                 }
                 var bodyBytes = Encoding.UTF8.GetBytes(body);
@@ -371,6 +373,10 @@ namespace StudioHTTPAPI
             bool includeHead = includeHeadStr == "true" || includeHeadStr == "1";
             var includeHairStr = GetParam(query, "includeHair");
             bool includeHair = includeHairStr == "true" || includeHairStr == "1";
+            var includeEyesStr = GetParam(query, "includeEyes");
+            bool includeEyes = includeEyesStr == "true" || includeEyesStr == "1";
+            var includeEyebrowsStr = GetParam(query, "includeEyebrows");
+            bool includeEyebrows = includeEyebrowsStr == "true" || includeEyebrowsStr == "1";
             var dir = UserDataPath("export");
             Directory.CreateDirectory(dir);
             var fullPath = Path.Combine(dir, filename);
@@ -401,6 +407,7 @@ namespace StudioHTTPAPI
                     {
                         allRenderers.RemoveAll(r =>
                         {
+                            var n = r.name.ToLower();
                             var s = r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null)
                                 ? r.sharedMaterials[0].shader.name : "";
                             bool isBody = s == "Shader Forge/main_skin";
@@ -408,15 +415,23 @@ namespace StudioHTTPAPI
                             bool isHair = s == "Shader Forge/main_hair" || s == "Shader Forge/main_hair_front"
                                 || s == "Koikano/hair_main_sun" || s == "Koikano/hair_main_sun_front"
                                 || s == "xukmi/HairPlus" || s == "xukmi/HairFrontPlus";
-                            if (!isBody && !isFace && !isHair) return true;
-                            var n = r.name.ToLower();
-                            if (n.Contains("dankon") || n.Contains("dan_f")) return true;
-                            if (!includeHead && isFace) return true;
-                            if (!includeHair && isHair) return true;
-                            if (!includeHead && !isHair && (n.Contains("face") || n.StartsWith("cf_o_face") || n.Contains("eye") || n.Contains("tooth") || n.Contains("mayuge") || n.Contains("tang"))) return true;
-                            return false;
+                            bool isEye = n.Contains("eye") || n.Contains("ohitomi") || n.Contains("cf_o_eye");
+                            bool isEyebrow = n.Contains("mayuge") || n.Contains("eyeline");
+                            bool isGenital = n.Contains("dankon") || n.Contains("dan_f");
+                            bool isTeeth = n.Contains("tooth") || n.Contains("tang");
+
+                            if (isGenital) return true;
+                            if (isTeeth) return true;
+
+                            if (includeEyes && isEye) return false;
+                            if (includeEyebrows && isEyebrow) return false;
+                            if (includeHead && (isFace || n.Contains("face") || n.StartsWith("cf_o_face"))) return false;
+                            if (includeHair && isHair) return false;
+                            if (isBody) return false;
+
+                            return true;
                         });
-                        Log("EXPORT: bodyOnly" + (includeHead ? "+head" : "") + (includeHair ? "+hair" : "") + " filtered to " + allRenderers.Count + " renderers");
+                        Log("EXPORT: bodyOnly" + (includeHead ? "+head" : "") + (includeHair ? "+hair" : "") + (includeEyes ? "+eyes" : "") + (includeEyebrows ? "+eyebrows" : "") + " filtered to " + allRenderers.Count + " renderers");
                     }
 
                     if (allRenderers.Count == 0) { resultJson = "{\"error\":\"no renderers found\"}"; done.Set(); return; }
@@ -512,6 +527,130 @@ namespace StudioHTTPAPI
                             }
                         }
 
+                        // Toon/eye material extraction - before UV bake
+                        if (texPng == null && bodyOnly)
+                        {
+                            var rn = renderer.name.ToLower();
+                            var sn = renderer.sharedMaterials.Length > 0 && !ReferenceEquals(renderer.sharedMaterials[0], null)
+                                ? renderer.sharedMaterials[0].shader.name : "";
+                            bool toonMatch = sn.Contains("toon_") || sn.Contains("glasses") || sn.Contains("textureanimation")
+                                || rn.Contains("ohitomi") || rn.Contains("mayuge") || rn.Contains("eyeline") || rn.Contains("gag_eye");
+                            if (toonMatch)
+                            {
+                                Log("EXPORT: toon extraction for " + renderer.name + " shader=" + sn);
+                                var tmat = renderer.sharedMaterials.Length > 0 ? renderer.sharedMaterials[0] : null;
+                                if (!ReferenceEquals(tmat, null))
+                                {
+                                    // Strategy 1: copy mainTexture directly (no shader, raw pixel copy)
+                                    var mainTex = tmat.mainTexture;
+                                    if (!ReferenceEquals(mainTex, null))
+                                    {
+                                        Log("TEX: toon mainTexture=" + mainTex.GetType().Name + " " + mainTex.width + "x" + mainTex.height + " name=" + mainTex.name);
+                                        var copyRt = RenderTexture.GetTemporary(mainTex.width, mainTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                                        Graphics.Blit(mainTex, copyRt);  // null material = raw copy
+                                        var prevC = RenderTexture.active;
+                                        RenderTexture.active = copyRt;
+                                        var copyTex = new Texture2D(mainTex.width, mainTex.height, TextureFormat.RGBA32, false);
+                                        copyTex.ReadPixels(new Rect(0, 0, mainTex.width, mainTex.height), 0, 0);
+                                        copyTex.Apply();
+                                        RenderTexture.active = prevC;
+                                        RenderTexture.ReleaseTemporary(copyRt);
+
+                                        // Check if we got meaningful content
+                                        var sample = copyTex.GetPixel(mainTex.width / 2, mainTex.height / 2);
+                                        Color32[] px32 = copyTex.GetPixels32();
+                                        int nonZeroAlpha = 0;
+                                        for (int pi = 0; pi < px32.Length; pi += 100) { if (px32[pi].a > 10) nonZeroAlpha++; }
+                                        Log("TEX: toon direct copy sample=" + sample + " nonZeroAlpha/total=" + nonZeroAlpha + "/" + (px32.Length / 100));
+
+                                        if (nonZeroAlpha > 0)
+                                        {
+                                            // Process alpha for toon textures
+                                            bool isEyeWhite = rn.Contains("ohitomi") && sn.Contains("toon_eyew");
+                                            bool isEyebrowOrLine = rn.Contains("mayuge") || rn.Contains("eyeline");
+
+                                            if (isEyeWhite)
+                                            {
+                                                // Eye white: sample corners to find background color
+                                                float bgR = 0, bgG = 0, bgB = 0;
+                                                int bgSamples = 0;
+                                                int[] corners = { 0, 10, px32.Length - 10, px32.Length / 2 - 10 };
+                                                foreach (var ci in corners)
+                                                {
+                                                    if (ci >= 0 && ci < px32.Length) { bgR += px32[ci].r; bgG += px32[ci].g; bgB += px32[ci].b; bgSamples++; }
+                                                }
+                                                if (bgSamples > 0) { bgR /= bgSamples; bgG /= bgSamples; bgB /= bgSamples; }
+                                                Log("TEX: eyeWhite bg=("+bgR+","+bgG+","+bgB+")");
+                                                var outPx = new Color32[px32.Length];
+                                                for (int pi = 0; pi < px32.Length; pi++)
+                                                {
+                                                    float dr = Math.Abs(px32[pi].r - bgR) / 255f;
+                                                    float dg = Math.Abs(px32[pi].g - bgG) / 255f;
+                                                    float db = Math.Abs(px32[pi].b - bgB) / 255f;
+                                                    float diff = (dr + dg + db) / 3.0f;
+                                                    byte a = (byte)Math.Min(255, (int)(Math.Min(diff * 12.0f, 1.0f) * 255));
+                                                    outPx[pi] = new Color32(px32[pi].r, px32[pi].g, px32[pi].b, a);
+                                                }
+                                                px32 = outPx;
+                                            }
+                                            else if (isEyebrowOrLine)
+                                            {
+                                                // Eyebrow/eyeline: solid shader color, mesh defines the shape
+                                                var tmat2 = renderer.sharedMaterials[0];
+                                                Color shaderColor = new Color(0.15f, 0.12f, 0.1f, 1f);
+                                                if (tmat2.HasProperty("_Color")) shaderColor = tmat2.GetColor("_Color");
+                                                else if (tmat2.HasProperty("_shadowcolor")) shaderColor = tmat2.GetColor("_shadowcolor");
+                                                Log("TEX: eyebrow color=" + shaderColor + " for " + renderer.name);
+                                                byte cr = (byte)(shaderColor.r * 255);
+                                                byte cg = (byte)(shaderColor.g * 255);
+                                                byte cb = (byte)(shaderColor.b * 255);
+                                                var outPx = new Color32[px32.Length];
+                                                for (int pi = 0; pi < px32.Length; pi++)
+                                                {
+                                                    outPx[pi] = new Color32(cr, cg, cb, 200);
+                                                }
+                                                Log("TEX: eyebrow filled (" + cr + "," + cg + "," + cb + ",200)");
+                                                px32 = outPx;
+                                            }
+
+                                            texPng = GlbBuilder.EncodePngRaw(px32, copyTex.width, copyTex.height);
+                                            SaveDebugTexture(texPng, "toon_direct_" + renderer.name + ".png");
+                                            Log("TEX: toon direct OK " + copyTex.width + "x" + copyTex.height + " png=" + texPng.Length);
+                                        }
+                                        UnityEngine.Object.Destroy(copyTex);
+                                    }
+
+                                    // Strategy 2: if mainTexture gave nothing, try Blit through shader with white input
+                                    if (texPng == null)
+                                    {
+                                        Log("TEX: toon Blit fallback for " + renderer.name);
+                                        var whiteTex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                                        var whitePx = new Color32[16];
+                                        for (int bi = 0; bi < 16; bi++) whitePx[bi] = new Color32(255, 255, 255, 255);
+                                        whiteTex.SetPixels32(whitePx);
+                                        whiteTex.Apply();
+                                        var blitRt = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                                        var blitMat = new Material(tmat);
+                                        Graphics.Blit(whiteTex, blitRt, blitMat);
+                                        var prevB = RenderTexture.active;
+                                        RenderTexture.active = blitRt;
+                                        var blitResult = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
+                                        blitResult.ReadPixels(new Rect(0, 0, resolution, resolution), 0, 0);
+                                        blitResult.Apply();
+                                        RenderTexture.active = prevB;
+                                        RenderTexture.ReleaseTemporary(blitRt);
+                                        UnityEngine.Object.DestroyImmediate(blitMat);
+                                        UnityEngine.Object.Destroy(whiteTex);
+
+                                        texPng = GlbBuilder.EncodePngRaw(blitResult.GetPixels32(), blitResult.width, blitResult.height);
+                                        SaveDebugTexture(texPng, "toon_blit_" + renderer.name + ".png");
+                                        Log("TEX: toon Blit " + blitResult.width + "x" + blitResult.height + " png=" + texPng.Length);
+                                        UnityEngine.Object.Destroy(blitResult);
+                                    }
+                                }
+                            }
+                        }
+
                         if (texPng == null && bodyOnly)
                         {
                             Log("EXPORT: UV bake via unlit for " + renderer.name);
@@ -540,6 +679,8 @@ namespace StudioHTTPAPI
                         var shaderName = renderer.sharedMaterials.Length > 0 && !ReferenceEquals(renderer.sharedMaterials[0], null)
                             ? renderer.sharedMaterials[0].shader.name : "";
                         bool isHair = shaderName.Contains("hair");
+                        bool isToon = shaderName.Contains("toon_") || shaderName.Contains("glasses")
+                            || shaderName.Contains("textureanimation");
 
                         Color hc1 = Color.white, hc2 = Color.gray, hc3 = Color.black, hShadow = Color.gray, hLine = Color.white;
                         byte[] normalPng = null, specularPng = null, alphaPng = null;
@@ -592,7 +733,8 @@ namespace StudioHTTPAPI
                             color3 = hc3,
                             shadowColor = hShadow,
                             lineColor = hLine,
-                            isHair = isHair
+                            isHair = isHair,
+                            isToon = isToon
                         });
 
                         Log("EXPORT: " + renderer.name + " tex=" + (texPng != null ? texPng.Length + "b" : "none"));
@@ -766,6 +908,120 @@ namespace StudioHTTPAPI
                 sb.Append("]}");
 
                 return sb.ToString();
+            }
+            catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
+        }
+
+        private string DebugRenderers(string query)
+        {
+            var indexStr = GetParam(query, "index") ?? "0";
+            int index; if (!int.TryParse(indexStr, out index)) index = 0;
+            try
+            {
+                var cc = GetChaControlByIndex(index);
+                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character at index " + index + "\"}";
+
+                var allRenderers = FindAllRenderers(cc);
+                var sb = new StringBuilder("[");
+                for (int i = 0; i < allRenderers.Count; i++)
+                {
+                    var r = allRenderers[i];
+                    if (i > 0) sb.Append(",");
+                    var shader = r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null)
+                        ? r.sharedMaterials[0].shader.name : "none";
+                    var matCount = r.sharedMaterials.Length;
+                    var matNames = new StringBuilder("[");
+                    for (int mi = 0; mi < matCount; mi++)
+                    {
+                        if (mi > 0) matNames.Append(",");
+                        var m = r.sharedMaterials[mi];
+                        matNames.Append("\"" + (ReferenceEquals(m, null) ? "null" : m.shader.name) + "\"");
+                    }
+                    matNames.Append("]");
+                    sb.Append("{\"index\":" + i
+                        + ",\"name\":\"" + Escape(r.name)
+                        + "\",\"shader\":\"" + Escape(shader)
+                        + "\",\"materials\":" + matNames
+                        + ",\"verts\":" + r.sharedMesh.vertexCount
+                        + ",\"path\":\"" + Escape(GetGameObjectPath(r.gameObject)) + "\"}");
+                }
+                sb.Append("]");
+                return "{\"renderers\":" + sb.ToString() + ",\"count\":" + allRenderers.Count + "}";
+            }
+            catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
+        }
+
+        private string GetGameObjectPath(GameObject go)
+        {
+            var path = go.name;
+            var t = go.transform.parent;
+            while (!ReferenceEquals(t, null))
+            {
+                path = t.name + "/" + path;
+                t = t.parent;
+            }
+            return path;
+        }
+
+        private string DebugShader(string query)
+        {
+            var indexStr = GetParam(query, "index") ?? "0";
+            int index; if (!int.TryParse(indexStr, out index)) index = 0;
+            var nameFilter = GetParam(query, "name") ?? "";
+            try
+            {
+                var cc = GetChaControlByIndex(index);
+                if (ReferenceEquals(cc, null)) return "{\"error\":\"no character\"}";
+                var allRenderers = FindAllRenderers(cc);
+                var sb = new StringBuilder("[");
+                int idx = 0;
+                foreach (var r in allRenderers)
+                {
+                    if (!string.IsNullOrEmpty(nameFilter) && !r.name.ToLower().Contains(nameFilter.ToLower())) continue;
+                    if (idx > 0) sb.Append(",");
+                    sb.Append("{\"name\":\"" + Escape(r.name) + "\",\"shader\":\"" + Escape(r.sharedMaterials.Length > 0 && !ReferenceEquals(r.sharedMaterials[0], null) ? r.sharedMaterials[0].shader.name : "none") + "\",\"materials\":[");
+                    for (int mi = 0; mi < r.sharedMaterials.Length; mi++)
+                    {
+                        if (mi > 0) sb.Append(",");
+                        var mat = r.sharedMaterials[mi];
+                        if (ReferenceEquals(mat, null)) { sb.Append("null"); continue; }
+                        sb.Append("{\"shader\":\"" + Escape(mat.shader.name) + "\",\"mainTexture\":\"" + (ReferenceEquals(mat.mainTexture, null) ? "null" : mat.mainTexture.GetType().Name + " " + mat.mainTexture.width + "x" + mat.mainTexture.height + " name=" + mat.mainTexture.name) + "\",\"props\":[");
+                        // Enumerate all properties via ShaderUtil
+                        try
+                        {
+                            var suType = FindType("UnityEditor.ShaderUtil");
+                            if (!ReferenceEquals(suType, null))
+                            {
+                                var pcm = suType.GetMethod("GetPropertyCount", BindingFlags.Public | BindingFlags.Static);
+                                var pnm = suType.GetMethod("GetPropertyName", BindingFlags.Public | BindingFlags.Static);
+                                var ptm = suType.GetMethod("GetPropertyType", BindingFlags.Public | BindingFlags.Static);
+                                if (!ReferenceEquals(pcm, null))
+                                {
+                                    int pc = (int)pcm.Invoke(null, new object[] { mat.shader });
+                                    bool firstProp = true;
+                                    for (int pi = 0; pi < pc; pi++)
+                                    {
+                                        var pname = (string)pnm.Invoke(null, new object[] { mat.shader, pi });
+                                        var ptype = ptm.Invoke(null, new object[] { mat.shader, pi }).ToString();
+                                        if (ptype.Contains("Tex") || ptype.Contains("Texture"))
+                                        {
+                                            if (!firstProp) sb.Append(",");
+                                            firstProp = false;
+                                            var t = mat.GetTexture(pname);
+                                            sb.Append("{\"name\":\"" + pname + "\",\"type\":\"" + ptype + "\",\"value\":\"" + (ReferenceEquals(t, null) ? "null" : t.GetType().Name + " " + t.width + "x" + t.height + " name=" + t.name) + "\"}");
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        catch { }
+                        sb.Append("]}");
+                    }
+                    sb.Append("]}");
+                    idx++;
+                }
+                sb.Append("]");
+                return "{\"shaders\":" + sb.ToString() + "}";
             }
             catch (Exception ex) { return "{\"error\":\"" + Escape(ex.Message) + "\"}"; }
         }
@@ -1225,70 +1481,57 @@ namespace StudioHTTPAPI
                 var shader = mat.shader;
                 Log("TEX: shader=" + shader.name);
 
-                string[] knownProps = {
-                    "_MainTex", "_ColorTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap",
-                    "_ShadowTex", "_DetailTex", "_DetailMask", "_SubTex",
-                    "_NormalTex", "_BumpTex", "_SpecularTex", "_RampTex",
-                    "_ShadowColorMultiplyTex", "_ShadowColorTexture",
-                    "_TexID", "_MainTex2", "_Diffuse", "_Albedo",
-                    "_SkinTex", "_BodyTex", "_BodyTex2", "_FaceTex",
-                    "_HairTex", "_AccessTex", "_ColorMask", "_SubMask",
-                    "_DetailMask2", "_EyeTex", "_EyeHiTex", "_EyeHighLightTex",
-                    "_GradientTex", "_MetallicGlossMap", "_OcclusionMap",
-                    "_EmissionMap", "_BumpMap", "_ParallaxMap",
-                    "_lightMap", "_MaskTex", "_AlphaMask",
-                    "_colorTex", "_shadowTex", "_detailTex", "_subTex",
-                    "_tex1", "_tex2", "_texture",
-                    "_ReflectionTex", "_GrabTexture",
-                    "_EyehlUpTex", "_EyeHiUpTex", "_EyeHLUpTex"
-                };
-
-                int foundCount = 0;
-                foreach (var pn in knownProps)
+                // Use ShaderUtil via reflection (Unity 5.x compatible)
+                try
                 {
-                    var t = mat.GetTexture(pn);
-                    if (!ReferenceEquals(t, null))
+                    var shaderUtilType = FindType("UnityEditor.ShaderUtil");
+                    if (!ReferenceEquals(shaderUtilType, null))
                     {
-                        Log("TEX: mat[" + matIndex + "] " + pn + " = " + t.GetType().Name + " " + t.width + "x" + t.height + " name=" + t.name);
-                        foundCount++;
-                    }
-                }
-
-                if (foundCount == 0)
-                {
-                    Log("TEX: mat[" + matIndex + "] no textures found in known properties, trying ShaderUtil...");
-                    try
-                    {
-                        var shaderUtilType = FindType("UnityEditor.ShaderUtil");
-                        if (!ReferenceEquals(shaderUtilType, null))
+                        var propCountMethod = shaderUtilType.GetMethod("GetPropertyCount", BindingFlags.Public | BindingFlags.Static);
+                        if (!ReferenceEquals(propCountMethod, null))
                         {
-                            var propCountMethod = shaderUtilType.GetMethod("GetPropertyCount", BindingFlags.Public | BindingFlags.Static);
-                            if (!ReferenceEquals(propCountMethod, null))
+                            int count = (int)propCountMethod.Invoke(null, new object[] { shader });
+                            Log("TEX: ShaderUtil reports " + count + " properties for " + shader.name);
+                            var nameMethod = shaderUtilType.GetMethod("GetPropertyName", BindingFlags.Public | BindingFlags.Static);
+                            var typeMethod = shaderUtilType.GetMethod("GetPropertyType", BindingFlags.Public | BindingFlags.Static);
+                            for (int pi = 0; pi < count; pi++)
                             {
-                                int count = (int)propCountMethod.Invoke(null, new object[] { shader });
-                                Log("TEX: ShaderUtil reports " + count + " properties");
-                                for (int pi = 0; pi < count; pi++)
+                                if (ReferenceEquals(nameMethod, null) || ReferenceEquals(typeMethod, null)) break;
+                                var propName = (string)nameMethod.Invoke(null, new object[] { shader, pi });
+                                var propType = typeMethod.Invoke(null, new object[] { shader, pi });
+                                var propTypeStr = propType.ToString();
+                                if (propTypeStr.Contains("Tex") || propTypeStr.Contains("Texture"))
                                 {
-                                    var nameMethod = shaderUtilType.GetMethod("GetPropertyName", BindingFlags.Public | BindingFlags.Static);
-                                    var typeMethod = shaderUtilType.GetMethod("GetPropertyType", BindingFlags.Public | BindingFlags.Static);
-                                    if (!ReferenceEquals(nameMethod, null) && !ReferenceEquals(typeMethod, null))
-                                    {
-                                        var propName = (string)nameMethod.Invoke(null, new object[] { shader, pi });
-                                        var propType = typeMethod.Invoke(null, new object[] { shader, pi });
-                                        var propTypeStr = propType.ToString();
-                                        Log("TEX: prop[" + pi + "] name=" + propName + " type=" + propTypeStr);
-                                        if (propTypeStr.Contains("Tex") || propTypeStr.Contains("Texture"))
-                                        {
-                                            var t = mat.GetTexture(propName);
-                                            if (!ReferenceEquals(t, null))
-                                                Log("TEX:   -> " + t.GetType().Name + " " + t.width + "x" + t.height);
-                                        }
-                                    }
+                                    var t = mat.GetTexture(propName);
+                                    if (!ReferenceEquals(t, null))
+                                        Log("TEX: mat[" + matIndex + "] " + propName + " = " + t.GetType().Name + " " + t.width + "x" + t.height + " name=" + t.name);
+                                    else
+                                        Log("TEX: mat[" + matIndex + "] " + propName + " = null");
                                 }
                             }
                         }
                     }
-                    catch (Exception ex) { Log("TEX: ShaderUtil reflection failed: " + ex.Message); }
+                }
+                catch (Exception ex) { Log("TEX: ShaderUtil reflection failed: " + ex.Message); }
+
+                // Also try to dump via MaterialPropertyDrawer or known toon eye props
+                string[] toonEyeProps = {
+                    "_MainTex", "_ColorTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap",
+                    "_Tex1", "_Tex2", "_Tex", "_tex", "_texture",
+                    "_EyeTex", "_EyeWhiteTex", "_EyeHiTex", "_EyeHighLightTex",
+                    "_EyehlUpTex", "_EyeHiUpTex", "_EyeHLUpTex",
+                    "_ColorMask", "_SubTex", "_MaskTex", "_AlphaMask",
+                    "_ShadowTex", "_DetailTex", "_NormalTex", "_BumpTex",
+                    "_SpecularTex", "_RampTex", "_GradientTex",
+                    "_ShadowColorMultiplyTex", "_ShadowColorTexture",
+                    "_lightMap", "_LightMap", "_ReflectionTex", "_GrabTexture",
+                    "_ColorTex1", "_ColorTex2", "_Diffuse1", "_Diffuse2"
+                };
+                foreach (var pn in toonEyeProps)
+                {
+                    var t = mat.GetTexture(pn);
+                    if (!ReferenceEquals(t, null))
+                        Log("TEX: mat[" + matIndex + "] knownProp " + pn + " = " + t.GetType().Name + " " + t.width + "x" + t.height + " name=" + t.name);
                 }
             }
             catch (Exception ex) { Log("TEX: DumpMaterialTextures error: " + ex.Message); }
@@ -2113,6 +2356,7 @@ namespace StudioHTTPAPI
         public Color shadowColor;
         public Color lineColor;
         public bool isHair;
+        public bool isToon;
     }
 
     public static class GlbBuilder
@@ -2303,9 +2547,12 @@ namespace StudioHTTPAPI
                 {
                     for (int j = 0; j < norms.Length; j++)
                     {
-                        BitConverter.GetBytes(norms[j].x).CopyTo(buf, 0);
-                        BitConverter.GetBytes(norms[j].y).CopyTo(buf, 4);
-                        BitConverter.GetBytes(-norms[j].z).CopyTo(buf, 8);
+                        float nx = norms[j].x, ny = norms[j].y, nz = -norms[j].z;
+                        float len = (float)Math.Sqrt(nx * nx + ny * ny + nz * nz);
+                        if (len > 0.0001f) { nx /= len; ny /= len; nz /= len; }
+                        BitConverter.GetBytes(nx).CopyTo(buf, 0);
+                        BitConverter.GetBytes(ny).CopyTo(buf, 4);
+                        BitConverter.GetBytes(nz).CopyTo(buf, 8);
                         binMs.Write(buf, 0, 12);
                     }
                 }
@@ -2344,6 +2591,9 @@ namespace StudioHTTPAPI
                         BitConverter.GetBytes((ushort)tri[j + 2]).CopyTo(sBuf, 0); binMs.Write(sBuf, 0, 2);
                         BitConverter.GetBytes((ushort)tri[j + 1]).CopyTo(sBuf, 0); binMs.Write(sBuf, 0, 2);
                     }
+                    // Pad index data to 4-byte alignment
+                    int idxPad = (4 - (actualIdxLen[i] % 4)) % 4;
+                    if (idxPad > 0) binMs.Write(new byte[idxPad], 0, idxPad);
                 }
             }
 
@@ -2360,6 +2610,9 @@ namespace StudioHTTPAPI
                     off[i] = (int)binMs.Position;
                     len[i] = data.Length;
                     binMs.Write(data, 0, data.Length);
+                    // Pad to 4-byte alignment
+                    int pad = (4 - (data.Length % 4)) % 4;
+                    if (pad > 0) binMs.Write(new byte[pad], 0, pad);
                     glbIdx[i] = texCount++;
                 }
                 else { glbIdx[i] = -1; len[i] = 0; }
@@ -2461,6 +2714,7 @@ namespace StudioHTTPAPI
                 sb.Append("}");
                 if (normTexGlbIdx[i] >= 0) sb.Append(",\"normalTexture\":{\"index\":" + normTexGlbIdx[i] + "}");
                 if (alphaTexGlbIdx[i] >= 0) sb.Append(",\"alphaMode\":\"MASK\",\"alphaCutoff\":0.5");
+                if (entries[i].isToon && texGlbIdx[i] >= 0) sb.Append(",\"alphaMode\":\"BLEND\",\"doubleSided\":true");
                 if (entries[i].isHair)
                 {
                     sb.Append(",\"extras\":{\"shader\":\"" + EscapeJson(entries[i].shaderName) + "\"");
@@ -2632,7 +2886,7 @@ namespace StudioHTTPAPI
             return t;
         }
 
-        static string F(float v) { return v.ToString("G", System.Globalization.CultureInfo.InvariantCulture); }
+        static string F(float v) { return v.ToString("R", System.Globalization.CultureInfo.InvariantCulture); }
 
         static string EscapeJson(string s) { if (s == null) return ""; return s.Replace("\\", "\\\\").Replace("\"", "\\\""); }
     }

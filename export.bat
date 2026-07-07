@@ -1,56 +1,124 @@
 @echo off
 setlocal enabledelayedexpansion
 
-set STUDIO_EXE=C:\Games\KK\KKIRV2\CharaStudio.exe
+:: === Configuration ===
+set KK_DIR=C:\Games\KK\KKIRV2
+set STUDIO_EXE=%KK_DIR%\CharaStudio.exe
+set PLUGIN_SRC=%KK_DIR%\BepInEx\plugins\StudioHTTPAPI
+set PLUGIN_DLL=%KK_DIR%\BepInEx\plugins\StudioHTTPAPI.dll
 set URL=http://localhost:8080
 set WAIT_SECONDS=40
+set CHAR_INDEX=0
+set RESOLUTION=2048
+
+:: Generate output filename
 set OUTPUT_FILE=export_%date:~-4%%date:~-7,2%%date:~-10,2%_%time:~0,2%%time:~3,2%%time:~6,2%.glb
 set OUTPUT_FILE=%OUTPUT_FILE: =0%
 
-echo === GLB Auto Export ===
+echo === KK GLB Auto Export ===
 echo.
 
-echo [1/6] Launching Chara Studio...
-start "" "%STUDIO_EXE%"
-echo       Waiting %WAIT_SECONDS% seconds for Studio to load...
-timeout /t %WAIT_SECONDS% /nobreak >nul
+:: === Step 1: Build plugin if source is newer than DLL ===
+echo [1/7] Checking plugin build...
 
-echo [2/6] Checking connection...
+:: Check if .cs source exists and if build is needed
+set NEED_BUILD=0
+if exist "%PLUGIN_SRC%\StudioHTTPAPI.cs" (
+    if not exist "%PLUGIN_DLL%" (
+        set NEED_BUILD=1
+    ) else (
+        :: Compare timestamps using PowerShell
+        powershell -Command "if ((Get-Item '%PLUGIN_SRC%\StudioHTTPAPI.cs').LastWriteTime -gt (Get-Item '%PLUGIN_DLL%').LastWriteTime) { exit 1 } else { exit 0 }" >nul 2>&1
+        if !errorlevel! equ 1 set NEED_BUILD=1
+    )
+)
+
+if !NEED_BUILD! equ 1 (
+    echo       Source changed, building plugin...
+    dotnet build "%PLUGIN_SRC%\StudioHTTPAPI.csproj" -c Release --nologo -v q 2>&1 | findstr /i "error"
+    if !errorlevel! neq 0 (
+        echo       Build failed!
+        pause
+        exit /b 1
+    )
+    :: Copy DLL to BepInEx plugins root (where BepInEx loads it)
+    copy /Y "%PLUGIN_SRC%\bin\Release\net46\StudioHTTPAPI.dll" "%PLUGIN_DLL%" >nul
+    echo       Plugin built and deployed.
+    set RESTART_STUDIO=1
+) else (
+    echo       Plugin is up to date.
+    set RESTART_STUDIO=0
+)
+
+:: === Step 2: Check if CharaStudio is running, restart if plugin was rebuilt ===
+echo [2/7] Checking CharaStudio...
+
+set STUDIO_RUNNING=0
+tasklist /FI "IMAGENAME eq CharaStudio.exe" 2>nul | find /i "CharaStudio.exe" >nul
+if !errorlevel! equ 0 set STUDIO_RUNNING=1
+
+if !RESTART_STUDIO! equ 1 (
+    if !STUDIO_RUNNING! equ 1 (
+        echo       Stopping CharaStudio (plugin updated)...
+        taskkill /F /IM CharaStudio.exe >nul 2>&1
+        timeout /t 3 /nobreak >nul
+    )
+)
+
+if !STUDIO_RUNNING! equ 0 (
+    echo       Starting CharaStudio...
+    start "" "%STUDIO_EXE%"
+    echo       Waiting %WAIT_SECONDS% seconds for Studio to load...
+    timeout /t %WAIT_SECONDS% /nobreak >nul
+) else (
+    if !RESTART_STUDIO! equ 0 (
+        echo       CharaStudio is running.
+    )
+)
+
+:: === Step 3: Wait for plugin HTTP server ===
+echo [3/7] Connecting to plugin...
 set CONNECTED=0
-for /l %%i in (1,1,5) do (
+for /l %%i in (1,1,10) do (
     if !CONNECTED! equ 0 (
-        powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/status' -TimeoutSec 5 -UseBasicParsing).Content } catch { exit 1 }" >nul 2>&1
+        powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/status' -TimeoutSec 3 -UseBasicParsing).Content } catch { exit 1 }" >nul 2>&1
         if !errorlevel! equ 0 (
             echo       Connected.
             set CONNECTED=1
         ) else (
-            echo       Attempt %%i/5 - retrying in 5s...
+            echo       Waiting... (attempt %%i/10)
             timeout /t 5 /nobreak >nul
         )
     )
 )
 if !CONNECTED! equ 0 (
-    echo FAIL: Cannot connect to plugin
+    echo FAIL: Cannot connect to plugin after 50 seconds
+    pause
     exit /b 1
 )
 
-echo [3/6] Adding character (index 0)...
-powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/add-character?index=0' -Method POST -TimeoutSec 10 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
+:: === Step 4: Add character ===
+echo [4/7] Adding character (index %CHAR_INDEX%)...
+powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/add-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 10 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 echo       Waiting 8 seconds for character to load...
 timeout /t 8 /nobreak >nul
 
-echo [4/6] Listing characters...
+:: === Step 5: List characters ===
+echo [5/7] Listing characters...
 powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/list-characters' -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 
-echo [5/6] Selecting character (index 0)...
-powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/select-character?index=0' -Method POST -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
+:: === Step 6: Select character ===
+echo [6/7] Selecting character (index %CHAR_INDEX%)...
+powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/select-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 timeout /t 2 /nobreak >nul
 
-echo [6/6] Exporting GLB with bodyOnly=true + head + hair...
-powershell -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&includeHair=true&resolution=2048' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
+:: === Step 7: Export GLB ===
+echo [7/7] Exporting GLB...
+echo       Options: bodyOnly + head + hair + eyes + eyebrows, resolution=%RESOLUTION%
+powershell -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&includeHair=true&includeEyes=true&includeEyebrows=true&resolution=%RESOLUTION%' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
 
 echo.
-echo === Done ===
-echo Output: %OUTPUT_FILE%
+echo === Export Complete ===
+echo Output: %KK_DIR%\UserData\export\%OUTPUT_FILE%
 echo.
 pause
