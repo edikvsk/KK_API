@@ -11,9 +11,8 @@ set WAIT_SECONDS=40
 set CHAR_INDEX=0
 set RESOLUTION=2048
 
-:: Generate output filename
-set OUTPUT_FILE=export_%date:~-4%%date:~-7,2%%date:~-10,2%_%time:~0,2%%time:~3,2%%time:~6,2%.glb
-set OUTPUT_FILE=%OUTPUT_FILE: =0%
+:: Generate output filename (locale-independent via PowerShell)
+for /f "usebackq delims=" %%d in (`powershell -NoProfile -NonInteractive -Command "Get-Date -Format 'yyyyMMdd_HHmmss'"`) do set OUTPUT_FILE=export_%%d.glb
 
 echo === KK GLB Auto Export ===
 echo.
@@ -28,7 +27,7 @@ if exist "%PLUGIN_SRC%\StudioHTTPAPI.cs" (
         set NEED_BUILD=1
     ) else (
         :: Compare timestamps using PowerShell
-        powershell -Command "if ((Get-Item '%PLUGIN_SRC%\StudioHTTPAPI.cs').LastWriteTime -gt (Get-Item '%PLUGIN_DLL%').LastWriteTime) { exit 1 } else { exit 0 }" >nul 2>&1
+        powershell -NoProfile -NonInteractive -Command "if ((Get-Item '%PLUGIN_SRC%\StudioHTTPAPI.cs').LastWriteTime -gt (Get-Item '%PLUGIN_DLL%').LastWriteTime) { exit 1 } else { exit 0 }" >nul 2>&1
         if !errorlevel! equ 1 set NEED_BUILD=1
     )
 )
@@ -36,7 +35,7 @@ if exist "%PLUGIN_SRC%\StudioHTTPAPI.cs" (
 if !NEED_BUILD! equ 1 (
     echo       Source changed, building plugin...
     dotnet build "%PLUGIN_SRC%\StudioHTTPAPI.csproj" -c Release --nologo -v q 2>&1 | findstr /i "error"
-    if !errorlevel! neq 0 (
+    if !errorlevel! equ 0 (
         echo       Build failed!
         pause
         exit /b 1
@@ -81,7 +80,7 @@ echo [3/7] Connecting to plugin...
 set CONNECTED=0
 for /l %%i in (1,1,10) do (
     if !CONNECTED! equ 0 (
-        powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/status' -TimeoutSec 3 -UseBasicParsing).Content } catch { exit 1 }" >nul 2>&1
+        powershell -NoProfile -NonInteractive -Command "try { (Invoke-WebRequest -Uri '%URL%/status' -TimeoutSec 3 -UseBasicParsing).Content } catch { exit 1 }" >nul 2>&1
         if !errorlevel! equ 0 (
             echo       Connected.
             set CONNECTED=1
@@ -99,26 +98,24 @@ if !CONNECTED! equ 0 (
 
 :: === Step 4: Add character ===
 echo [4/7] Adding character (index %CHAR_INDEX%)...
-powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/add-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 10 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
+powershell -NoProfile -NonInteractive -Command "try { (Invoke-WebRequest -Uri '%URL%/add-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 10 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 echo       Waiting 8 seconds for character to load...
 timeout /t 8 /nobreak >nul
 
 :: === Step 5: List characters ===
 echo [5/7] Listing characters...
-powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/list-characters' -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
+powershell -NoProfile -NonInteractive -Command "try { (Invoke-WebRequest -Uri '%URL%/list-characters' -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 
 :: === Step 6: Select character ===
 echo [6/7] Selecting character (index %CHAR_INDEX%)...
-powershell -Command "try { (Invoke-WebRequest -Uri '%URL%/select-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
+powershell -NoProfile -NonInteractive -Command "try { (Invoke-WebRequest -Uri '%URL%/select-character?index=%CHAR_INDEX%' -Method POST -TimeoutSec 5 -UseBasicParsing).Content } catch { Write-Output 'ERROR' }"
 timeout /t 2 /nobreak >nul
 
 :: === Step 7: Export GLB ===
 echo [7/7] Exporting GLB...
 echo       Options: bodyOnly + head + hair + eyes + eyebrows, resolution=%RESOLUTION%
-powershell -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&includeHair=true&includeEyes=true&includeEyebrows=true&resolution=%RESOLUTION%' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
+powershell -NoProfile -NonInteractive -Command "$r = Invoke-WebRequest -Uri '%URL%/export-glb?filename=%OUTPUT_FILE%&bodyOnly=true&includeHead=true&includeHair=true&includeEyes=true&includeEyebrows=true&resolution=%RESOLUTION%' -Method POST -TimeoutSec 120 -UseBasicParsing; $r.Content"
 
 echo.
 echo === Export Complete ===
 echo Output: %KK_DIR%\UserData\export\%OUTPUT_FILE%
-echo.
-pause
