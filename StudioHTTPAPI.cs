@@ -472,35 +472,63 @@ namespace StudioHTTPAPI
                         // === BODY TEXTURE (first, so we can cache it for face) ===
                         if (texPng == null && bodyOnly && ri == 0 && isBodyRenderer)
                         {
-                            var rawTex = FindRawBodyTexture(cc);
-                            if (!ReferenceEquals(rawTex, null))
+                            // Strategy 1: Read matDraw directly — it's the FINAL composited texture
+                            // (albedo + detail overlays + skin color already baked in by the game)
+                            var matDrawTex = ReadBodyMatDraw(cc, resolution);
+                            if (!ReferenceEquals(matDrawTex, null))
                             {
-                                var readable = MakeReadable(rawTex);
-                                if (!ReferenceEquals(readable, null))
+                                var sample = matDrawTex.GetPixel(resolution / 2, resolution / 2);
+                                if (sample.a > 0.01f && (sample.r + sample.g + sample.b) > 0.1f)
                                 {
-                                    texPng = GlbBuilder.EncodePngRaw(readable.GetPixels32(), readable.width, readable.height);
+                                    texPng = GlbBuilder.EncodePngRaw(matDrawTex.GetPixels32(), matDrawTex.width, matDrawTex.height);
                                     bodyTexCache = texPng;
-                                    SaveDebugTexture(texPng, "body_raw_texture.png");
-                                    Log("EXPORT: raw body texture " + readable.width + "x" + readable.height + " png=" + texPng.Length);
-                                    UnityEngine.Object.Destroy(readable);
+                                    SaveDebugTexture(texPng, "body_matdraw.png");
+                                    Log("EXPORT: body matDraw direct " + matDrawTex.width + "x" + matDrawTex.height + " sample=" + sample + " png=" + texPng.Length);
+                                    UnityEngine.Object.Destroy(matDrawTex);
                                 }
                                 else
                                 {
-                                    Log("EXPORT: raw texture not readable, trying RT copy");
-                                    var rt2 = RenderTexture.GetTemporary(rawTex.width, rawTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                                    Graphics.Blit(rawTex, rt2);
-                                    var prevActive = RenderTexture.active;
-                                    RenderTexture.active = rt2;
-                                    var t2d = new Texture2D(rawTex.width, rawTex.height, TextureFormat.RGBA32, false);
-                                    t2d.ReadPixels(new Rect(0, 0, rawTex.width, rawTex.height), 0, 0);
-                                    t2d.Apply();
-                                    RenderTexture.active = prevActive;
-                                    RenderTexture.ReleaseTemporary(rt2);
-                                    texPng = GlbBuilder.EncodePngRaw(t2d.GetPixels32(), t2d.width, t2d.height);
-                                    bodyTexCache = texPng;
-                                    SaveDebugTexture(texPng, "body_raw_texture.png");
-                                    Log("EXPORT: raw body texture via RT " + t2d.width + "x" + t2d.height + " png=" + texPng.Length);
-                                    UnityEngine.Object.Destroy(t2d);
+                                    Log("EXPORT: body matDraw empty (sample=" + sample + ")");
+                                    UnityEngine.Object.Destroy(matDrawTex);
+                                }
+                            }
+
+                            // Strategy 2: Raw texture + skin color tinting (fallback)
+                            if (texPng == null)
+                            {
+                                var rawTex = FindRawBodyTexture(cc);
+                                if (!ReferenceEquals(rawTex, null))
+                                {
+                                    var readable = MakeReadable(rawTex);
+                                    if (!ReferenceEquals(readable, null))
+                                    {
+                                        var tinted = ApplyColorTint(readable, skinColor);
+                                        texPng = GlbBuilder.EncodePngRaw(tinted.GetPixels32(), tinted.width, tinted.height);
+                                        bodyTexCache = texPng;
+                                        SaveDebugTexture(texPng, "body_tinted.png");
+                                        Log("EXPORT: body tinted " + tinted.width + "x" + tinted.height + " png=" + texPng.Length);
+                                        UnityEngine.Object.Destroy(tinted);
+                                        UnityEngine.Object.Destroy(readable);
+                                    }
+                                    else
+                                    {
+                                        var rt2 = RenderTexture.GetTemporary(rawTex.width, rawTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                                        Graphics.Blit(rawTex, rt2);
+                                        var prevActive = RenderTexture.active;
+                                        RenderTexture.active = rt2;
+                                        var t2d = new Texture2D(rawTex.width, rawTex.height, TextureFormat.RGBA32, false);
+                                        t2d.ReadPixels(new Rect(0, 0, rawTex.width, rawTex.height), 0, 0);
+                                        t2d.Apply();
+                                        RenderTexture.active = prevActive;
+                                        RenderTexture.ReleaseTemporary(rt2);
+                                        var tinted = ApplyColorTint(t2d, skinColor);
+                                        texPng = GlbBuilder.EncodePngRaw(tinted.GetPixels32(), tinted.width, tinted.height);
+                                        bodyTexCache = texPng;
+                                        SaveDebugTexture(texPng, "body_tinted.png");
+                                        Log("EXPORT: body tinted via RT " + tinted.width + "x" + tinted.height + " png=" + texPng.Length);
+                                        UnityEngine.Object.Destroy(tinted);
+                                        UnityEngine.Object.Destroy(t2d);
+                                    }
                                 }
                             }
                         }
@@ -1358,34 +1386,57 @@ namespace StudioHTTPAPI
                 mf.mesh = uvMesh;
                 var mr = meshObj.AddComponent<MeshRenderer>();
 
-                var unlitShader = Shader.Find("Unlit/Texture");
-                if (ReferenceEquals(unlitShader, null)) unlitShader = Shader.Find("Sprites/Default");
-                var bakeMat = new Material(unlitShader);
+                // Clone the ORIGINAL material to preserve all shader compositing layers
+                var srcMat = renderer.sharedMaterials[0];
+                var bakeMat = new Material(srcMat);
 
-                var srcTex = renderer.sharedMaterials.Length > 0 && !ReferenceEquals(renderer.sharedMaterials[0], null)
-                    ? renderer.sharedMaterials[0].mainTexture : null;
-                if (!ReferenceEquals(srcTex, null) && srcTex is RenderTexture srcRT)
+                // Replace any RenderTextures with temporary copies (can't use RT directly in UV bake)
+                string[] knownTexProps = {
+                    "_MainTex", "_ColorTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap",
+                    "_DetailTex", "_DetailMask", "_NormalTex", "_BumpTex",
+                    "_ShadowTex", "_SpecularTex", "_RampTex", "_GradientTex",
+                    "_ColorMask", "_AlphaMask", "_SubTex", "_SubMask",
+                    "_HairGloss", "_EyeTex", "_EyeHiTex",
+                    "_lightMap", "_LightMap",
+                    "_Tex1", "_Tex2", "_Tex", "_tex", "_texture",
+                    "_SkinTex", "_BodyTex", "_BodyTex2", "_FaceTex", "_HairTex"
+                };
+                var tmpRts = new System.Collections.Generic.List<RenderTexture>();
+                foreach (var propName in knownTexProps)
                 {
-                    var tmp = RenderTexture.GetTemporary(srcRT.width, srcRT.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
-                    Graphics.Blit(srcRT, tmp);
-                    bakeMat.mainTexture = tmp;
-                }
-                else if (!ReferenceEquals(srcTex, null))
-                {
-                    bakeMat.mainTexture = srcTex;
-                }
-                else
-                {
-                    var hairMat = new Material(renderer.sharedMaterials[0]);
-                    if (hairMat.HasProperty("ShadowColor")) hairMat.SetColor("ShadowColor", Color.white);
-                    if (hairMat.HasProperty("ShadowExtend")) hairMat.SetFloat("ShadowExtend", 0f);
-                    if (hairMat.HasProperty("rimV")) hairMat.SetFloat("rimV", 0f);
-                    if (hairMat.HasProperty("rimpower")) hairMat.SetFloat("rimpower", 0f);
-                    UnityEngine.Object.DestroyImmediate(bakeMat);
-                    bakeMat = hairMat;
-                    Log("TEX: UV bake using flat-lit material " + bakeMat.shader.name);
+                    if (!bakeMat.HasProperty(propName)) continue;
+                    var propTex = bakeMat.GetTexture(propName);
+                    if (propTex is RenderTexture rtex)
+                    {
+                        var tmp = RenderTexture.GetTemporary(rtex.width, rtex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                        Graphics.Blit(rtex, tmp);
+                        bakeMat.SetTexture(propName, tmp);
+                        tmpRts.Add(tmp);
+                    }
                 }
 
+                // Neutralize lighting/shadow effects to capture pure albedo
+                if (bakeMat.HasProperty("_ShadowColor")) bakeMat.SetColor("_ShadowColor", Color.clear);
+                if (bakeMat.HasProperty("_ShadowExtend")) bakeMat.SetFloat("_ShadowExtend", 0f);
+                if (bakeMat.HasProperty("_LineColor")) bakeMat.SetColor("_LineColor", Color.clear);
+                if (bakeMat.HasProperty("rimV")) bakeMat.SetFloat("rimV", 0f);
+                if (bakeMat.HasProperty("rimpower")) bakeMat.SetFloat("rimpower", 0f);
+                if (bakeMat.HasProperty("_RimV")) bakeMat.SetFloat("_RimV", 0f);
+                if (bakeMat.HasProperty("_Rimpower")) bakeMat.SetFloat("_Rimpower", 0f);
+                if (bakeMat.HasProperty("_Color")) bakeMat.SetColor("_Color", Color.white);
+
+                // Neutralize toon ramp — set to white so lighting is always bright
+                var whiteTex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                var whitePx = new Color32[16];
+                for (int bi = 0; bi < 16; bi++) whitePx[bi] = new Color32(255, 255, 255, 255);
+                whiteTex.SetPixels32(whitePx);
+                whiteTex.Apply();
+                foreach (var rn in new[] { "_RampTex", "_ToonRamp", "_Ramp", "_GradientTex", "_ShadowRamp" })
+                {
+                    if (bakeMat.HasProperty(rn)) bakeMat.SetTexture(rn, whiteTex);
+                }
+
+                Log("TEX: UV bake using cloned material " + bakeMat.shader.name);
                 mr.sharedMaterial = bakeMat;
 
                 cam.Render();
@@ -1398,15 +1449,94 @@ namespace StudioHTTPAPI
                 RenderTexture.active = prev;
                 RenderTexture.ReleaseTemporary(rt);
 
+                // Cleanup
+                foreach (var tmp in tmpRts) RenderTexture.ReleaseTemporary(tmp);
                 UnityEngine.Object.DestroyImmediate(camObj);
                 UnityEngine.Object.DestroyImmediate(meshObj);
                 UnityEngine.Object.DestroyImmediate(uvMesh);
                 UnityEngine.Object.DestroyImmediate(bakeMat);
 
-                Log("TEX: UV bake done " + tex.width + "x" + tex.height + " for " + renderer.name);
+                Log("TEX: UV bake done " + tex.width + "x" + tex.height + " for " + renderer.name + " shader=" + srcMat.shader.name);
                 return tex;
             }
             catch (Exception ex) { Log("TEX: UV bake failed: " + ex.Message); return null; }
+        }
+
+        private Texture2D CompositeThroughShader(SkinnedMeshRenderer renderer, int resolution)
+        {
+            try
+            {
+                var srcMat = renderer.sharedMaterials.Length > 0 ? renderer.sharedMaterials[0] : null;
+                if (ReferenceEquals(srcMat, null)) return null;
+
+                // Clone the material to preserve all shader compositing
+                var tempMat = new Material(srcMat);
+
+                // Replace ALL RenderTextures with temporary copies (body textures are often RTs)
+                string[] texProps = {
+                    "_MainTex", "_ColorTex", "_DiffuseTex", "_AlbedoTex", "_BaseMap",
+                    "_DetailTex", "_DetailMask", "_NormalTex", "_BumpTex",
+                    "_ShadowTex", "_SpecularTex", "_ColorMask", "_AlphaMask",
+                    "_SubTex", "_SkinTex", "_BodyTex", "_HairGloss",
+                    "_Tex1", "_Tex2", "_Tex"
+                };
+                foreach (var propName in texProps)
+                {
+                    if (!tempMat.HasProperty(propName)) continue;
+                    var t = tempMat.GetTexture(propName);
+                    if (t is RenderTexture rtex)
+                    {
+                        var tmp = RenderTexture.GetTemporary(rtex.width, rtex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                        Graphics.Blit(rtex, tmp);
+                        tempMat.SetTexture(propName, tmp);
+                    }
+                }
+
+                // Neutralize color/lighting to get pure albedo + detail compositing
+                if (tempMat.HasProperty("_Color")) tempMat.SetColor("_Color", Color.white);
+                if (tempMat.HasProperty("_ShadowColor")) tempMat.SetColor("_ShadowColor", Color.clear);
+                if (tempMat.HasProperty("_ShadowExtend")) tempMat.SetFloat("_ShadowExtend", 0f);
+                if (tempMat.HasProperty("_LineColor")) tempMat.SetColor("_LineColor", Color.clear);
+                if (tempMat.HasProperty("rimV")) tempMat.SetFloat("rimV", 0f);
+                if (tempMat.HasProperty("rimpower")) tempMat.SetFloat("rimpower", 0f);
+                if (tempMat.HasProperty("_RimV")) tempMat.SetFloat("_RimV", 0f);
+                if (tempMat.HasProperty("_Rimpower")) tempMat.SetFloat("_Rimpower", 0f);
+
+                // Neutralize toon ramp
+                var rampTex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                var rampPx = new Color32[16];
+                for (int bi = 0; bi < 16; bi++) rampPx[bi] = new Color32(255, 255, 255, 255);
+                rampTex.SetPixels32(rampPx);
+                rampTex.Apply();
+                foreach (var rn in new[] { "_RampTex", "_ToonRamp", "_Ramp", "_GradientTex", "_ShadowRamp" })
+                {
+                    if (tempMat.HasProperty(rn)) tempMat.SetTexture(rn, rampTex);
+                }
+
+                // Use white texture as input — shader will sample its own textures from the material
+                var whiteTex = new Texture2D(4, 4, TextureFormat.RGBA32, false);
+                var whitePx = new Color32[16];
+                for (int bi = 0; bi < 16; bi++) whitePx[bi] = new Color32(255, 255, 255, 255);
+                whiteTex.SetPixels32(whitePx);
+                whiteTex.Apply();
+
+                var rt2 = RenderTexture.GetTemporary(resolution, resolution, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(whiteTex, rt2, tempMat);
+
+                var prev = RenderTexture.active;
+                RenderTexture.active = rt2;
+                var tex = new Texture2D(resolution, resolution, TextureFormat.RGBA32, false);
+                tex.ReadPixels(new Rect(0, 0, resolution, resolution), 0, 0);
+                tex.Apply();
+                RenderTexture.active = prev;
+                RenderTexture.ReleaseTemporary(rt2);
+                UnityEngine.Object.DestroyImmediate(whiteTex);
+                UnityEngine.Object.DestroyImmediate(tempMat);
+
+                Log("TEX: CompositeThroughShader done " + tex.width + "x" + tex.height + " for " + renderer.name + " shader=" + srcMat.shader.name);
+                return tex;
+            }
+            catch (Exception ex) { Log("TEX: CompositeThroughShader failed: " + ex.Message); return null; }
         }
 
         private byte[] ExtractHairTextureFromMaterial(SkinnedMeshRenderer renderer, int resolution)
@@ -1908,6 +2038,80 @@ namespace StudioHTTPAPI
             catch (Exception ex) { Log("TEX: DumpMaterialTextures error: " + ex.Message); }
         }
 
+        private Texture2D ReadBodyMatDraw(ChaControl cc, int resolution)
+        {
+            try
+            {
+                var ccType = cc.GetType();
+                var prop = ccType.GetProperty("customTexCtrlBody", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (ReferenceEquals(prop, null)) { Log("TEX: customTexCtrlBody not found"); return null; }
+
+                var texCtrl = prop.GetValue(cc, null);
+                if (ReferenceEquals(texCtrl, null)) { Log("TEX: customTexCtrlBody is null"); return null; }
+
+                Material matDraw = null;
+                var matDrawField = texCtrl.GetType().GetField("matDraw", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+                if (!ReferenceEquals(matDrawField, null))
+                    matDraw = matDrawField.GetValue(texCtrl) as Material;
+
+                if (ReferenceEquals(matDraw, null))
+                {
+                    foreach (var f in texCtrl.GetType().GetFields(BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance))
+                    {
+                        if (f.Name.Contains("matDraw"))
+                        {
+                            matDraw = f.GetValue(texCtrl) as Material;
+                            break;
+                        }
+                    }
+                }
+
+                if (ReferenceEquals(matDraw, null)) { Log("TEX: body matDraw not found"); return null; }
+
+                var drawTex = matDraw.mainTexture;
+                if (ReferenceEquals(drawTex, null)) { Log("TEX: body matDraw.mainTexture is null"); return null; }
+
+                Log("TEX: body matDraw type=" + drawTex.GetType().Name + " " + drawTex.width + "x" + drawTex.height);
+
+                // Read the RenderTexture directly — it contains the final composited result
+                if (drawTex is RenderTexture rt)
+                {
+                    var prev = RenderTexture.active;
+                    RenderTexture.active = rt;
+                    var tex = new Texture2D(rt.width, rt.height, TextureFormat.RGBA32, false);
+                    tex.ReadPixels(new Rect(0, 0, rt.width, rt.height), 0, 0);
+                    tex.Apply();
+                    RenderTexture.active = prev;
+                    Log("TEX: body matDraw RT read " + rt.width + "x" + rt.height);
+                    return tex;
+                }
+
+                if (drawTex is Texture2D t2d)
+                {
+                    var readable = MakeReadable(t2d);
+                    if (!ReferenceEquals(readable, null))
+                    {
+                        Log("TEX: body matDraw T2D read " + readable.width + "x" + readable.height);
+                        return readable;
+                    }
+                }
+
+                // Fallback: Graphics.Blit
+                var rt2 = RenderTexture.GetTemporary(drawTex.width, drawTex.height, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB);
+                Graphics.Blit(drawTex, rt2);
+                var prev2 = RenderTexture.active;
+                RenderTexture.active = rt2;
+                var tex2 = new Texture2D(drawTex.width, drawTex.height, TextureFormat.RGBA32, false);
+                tex2.ReadPixels(new Rect(0, 0, drawTex.width, drawTex.height), 0, 0);
+                tex2.Apply();
+                RenderTexture.active = prev2;
+                RenderTexture.ReleaseTemporary(rt2);
+                Log("TEX: body matDraw Blit read " + tex2.width + "x" + tex2.height);
+                return tex2;
+            }
+            catch (Exception ex) { Log("TEX: ReadBodyMatDraw error: " + ex.Message); return null; }
+        }
+
         private Texture2D FindRawBodyTexture(ChaControl cc, string part = "body")
         {
             try
@@ -2401,6 +2605,24 @@ namespace StudioHTTPAPI
                 return readable;
             }
             catch { return null; }
+        }
+
+        private Texture2D ApplyColorTint(Texture2D source, Color tint)
+        {
+            var pixels = source.GetPixels32();
+            var result = new Color32[pixels.Length];
+            for (int i = 0; i < pixels.Length; i++)
+            {
+                result[i] = new Color32(
+                    (byte)(pixels[i].r * tint.r),
+                    (byte)(pixels[i].g * tint.g),
+                    (byte)(pixels[i].b * tint.b),
+                    pixels[i].a);
+            }
+            var output = new Texture2D(source.width, source.height, TextureFormat.RGBA32, false);
+            output.SetPixels32(result);
+            output.Apply();
+            return output;
         }
 
         private void RemoveSkinColorOverlay(Texture2D tex, Color skinMainColor)
